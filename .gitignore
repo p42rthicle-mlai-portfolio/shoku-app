@@ -1,0 +1,35 @@
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+*.so
+
+# Virtual environment
+.venv/
+venv/
+env/
+
+# Jupyter/IPython
+.ipynb_checkpoints
+
+# Streamlit secrets (config.toml is fine to keep)
+.streamlit/secrets.toml
+.streamlit/*.json
+.streamlit/*.yaml
+!.streamlit/config.toml
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Editors/IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# Distribution / packaging
+build/
+dist/
+*.egg-info/

@@ -157,6 +157,11 @@ def set_view_date_today():
     st.session_state.view_date = date.today()
 
 
+def clear_session_keys(keys):
+    for key in keys:
+        st.session_state.pop(key, None)
+
+
 def render_status_pie(calories_ok: bool, protein_ok: bool):
     green = "#2e7d32"
     red = "#c62828"
@@ -579,6 +584,10 @@ with tabs[2]:
 
 # --------- Tab 4: Master Data ---------
 with tabs[3]:
+    master_data_message = st.session_state.pop("master_data_message", None)
+    if master_data_message:
+        st.success(master_data_message)
+
     st.subheader("Foods (food + unit is unique)")
     with st.expander("Add food"):
         c1, c2, c3, c4 = st.columns(4)
@@ -624,9 +633,10 @@ with tabs[3]:
             else:
                 st.error("Name and unit required.")
 
-    st.dataframe(
-        foods.assign(key=foods.apply(food_key, axis=1)), use_container_width=True
-    )
+    with st.expander("View foods table", expanded=False):
+        st.dataframe(
+            foods.assign(key=foods.apply(food_key, axis=1)), use_container_width=True
+        )
 
     st.markdown("#### Edit a food")
     if not foods.empty:
@@ -1095,26 +1105,26 @@ with tabs[3]:
                         st.success("Ingredient removed and logs recalculated.")
                         st.rerun()
 
-    st.markdown("#### Current dishes")
-    if dishes.empty:
-        st.info("No dishes yet.")
-    else:
-        preview = []
-        for dname in sorted(dishes["dish_name"].tolist()):
-            base_c, base_p = compute_dish_base(dname, dishes, dings, foods)
-            drow = dishes[dishes["dish_name"] == dname].iloc[0]
-            yield_qty, yield_unit = get_dish_yield(drow)
-            preview.append(
-                {
-                    "dish_name": dname,
-                    "basis": get_dish_basis_label(dname, dishes),
-                    "final_qty": yield_qty if yield_qty > 0 else "",
-                    "final_unit": yield_unit,
-                    "calories": round(base_c, 2),
-                    "protein": round(base_p, 2),
-                }
-            )
-        st.dataframe(pd.DataFrame(preview), use_container_width=True)
+    with st.expander("View dishes table", expanded=False):
+        if dishes.empty:
+            st.info("No dishes yet.")
+        else:
+            preview = []
+            for dname in sorted(dishes["dish_name"].tolist()):
+                base_c, base_p = compute_dish_base(dname, dishes, dings, foods)
+                drow = dishes[dishes["dish_name"] == dname].iloc[0]
+                yield_qty, yield_unit = get_dish_yield(drow)
+                preview.append(
+                    {
+                        "dish_name": dname,
+                        "basis": get_dish_basis_label(dname, dishes),
+                        "final_qty": yield_qty if yield_qty > 0 else "",
+                        "final_unit": yield_unit,
+                        "calories": round(base_c, 2),
+                        "protein": round(base_p, 2),
+                    }
+                )
+            st.dataframe(pd.DataFrame(preview), use_container_width=True)
 
     st.markdown("#### Delete a dish")
     if not dishes.empty:
@@ -1142,7 +1152,17 @@ with tabs[3]:
                 save_df(dishes, DISHES_CSV)
                 save_df(dings, DISH_ING_CSV)
                 save_df(logs, LOGS_CSV)
-                st.success(f"Deleted dish {ddel}")
+                clear_session_keys(
+                    [
+                        "delete_dish_sel",
+                        "confirm_dish",
+                        "edit_dish_sel_unique",
+                        "edit_ing_dish_sel_unique",
+                        "add_ing_dish",
+                        "log_dish_name",
+                    ]
+                )
+                st.session_state.master_data_message = f"Deleted dish {ddel}"
                 st.rerun()
             else:
                 st.error("Confirmation did not match. No delete.")
@@ -1207,5 +1227,5 @@ with tabs[3]:
                 st.success("Goals applied to range.")
                 st.rerun()
 
-    st.markdown("#### All goals")
-    st.dataframe(goals.sort_values("date"), use_container_width=True)
+    with st.expander("View all goals", expanded=False):
+        st.dataframe(goals.sort_values("date"), use_container_width=True)

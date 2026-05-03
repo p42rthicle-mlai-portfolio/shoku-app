@@ -7,6 +7,53 @@ from pathlib import Path
 from datetime import date, timedelta
 from typing import Tuple
 
+import shutil
+import os
+
+# --- 1. SECURITY LAYER ---
+def check_password():
+    """Returns `True` if the user has the correct password."""
+    def password_entered():
+        # Compares entered password against the secret stored on the server
+        if st.session_state["password"] == st.secrets["password"]:
+            st.session_state["password_correct"] = True
+            del st.session_state["password"]  # Remove password from session state for security
+        else:
+            st.session_state["password_correct"] = False
+
+    if "password_correct" not in st.session_state:
+        st.text_input("Enter Password", type="password", on_change=password_entered, key="password")
+        return False
+    elif not st.session_state["password_correct"]:
+        st.text_input("Enter Password", type="password", on_change=password_entered, key="password")
+        st.error("😕 Password incorrect")
+        return False
+    return True
+
+# Stop the app from loading the rest of the code if the password is wrong
+if not check_password():
+    st.stop()
+
+
+# --- 2. BACKUP UTILITY ---
+st.sidebar.header("System Admin")
+if st.sidebar.button("Generate CSV Backup"):
+    # Creates a ZIP file of your entire 'data' folder
+    if os.path.exists("data"):
+        shutil.make_archive("backup_data", 'zip', "data")
+        with open("backup_data.zip", "rb") as f:
+            st.sidebar.download_button(
+                label="Download Backup ZIP",
+                data=f,
+                file_name="shoku_data_backup.zip",
+                mime="application/zip"
+            )
+    else:
+        st.sidebar.error("Data directory not found on server.")
+
+# --- YOUR EXISTING APP.PY CODE STARTS HERE ---
+# (Keep all your original logic below this line)
+
 if "allow_edit_past" not in st.session_state:
     st.session_state.allow_edit_past = False
 

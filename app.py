@@ -224,6 +224,14 @@ def render_status_pie(calories_ok: bool, protein_ok: bool):
     )
 
 
+def section_heading(title: str, help_text: str, level: int = 4):
+    c1, c2 = st.columns([0.96, 0.04])
+    with c1:
+        st.markdown(f"{'#' * level} {title}")
+    with c2:
+        st.button("i", key=f"help_{title.lower().replace(' ', '_')}", help=help_text)
+
+
 def is_override_dish(row) -> bool:
     return pd.notna(row.get("cal_override")) and pd.notna(row.get("protein_override"))
 
@@ -644,8 +652,15 @@ with tabs[3]:
     if master_data_message:
         st.success(master_data_message)
 
-    st.subheader("Foods (food + unit is unique)")
+    section_heading(
+        "Foods",
+        "Foods are atomic ingredients or packaged items. Food + unit is unique, so Milk [ml] and Milk [cup] are separate entries. Enter nutrition using a base quantity, like 100g or 250ml; Shoku derives per-unit values automatically.",
+        level=3,
+    )
     with st.expander("Add food"):
+        st.caption(
+            "Create a reusable food definition. Example: Rice, unit g, base quantity 100, calories 130, protein 2.7."
+        )
         c1, c2, c3, c4 = st.columns(4)
         with c1:
             f_name = st.text_input("Food name", key="add_food_name")
@@ -690,11 +705,17 @@ with tabs[3]:
                 st.error("Name and unit required.")
 
     with st.expander("View foods table", expanded=False):
+        st.caption(
+            "Reference table for all food definitions. Derived per-unit columns are what logs and ingredient dishes use."
+        )
         st.dataframe(
             foods.assign(key=foods.apply(food_key, axis=1)), use_container_width=True
         )
 
-    st.markdown("#### Edit a food")
+    section_heading(
+        "Edit a food",
+        "Change a food's name, unit, or nutrition values. Existing food logs are recalculated. If this food is used in dishes, keep propagation on when you are renaming the food or unit.",
+    )
     if not foods.empty:
         fedit = st.selectbox(
             "Select food to edit",
@@ -813,7 +834,10 @@ with tabs[3]:
 
 
 
-    st.markdown("#### Delete a food")
+    section_heading(
+        "Delete a food",
+        "Remove a food definition. This also deletes direct food logs for that food and removes matching ingredient references from dishes. Type the exact food key before deleting.",
+    )
     if not foods.empty:
         fdel = st.selectbox(
             "Select food to delete",
@@ -858,8 +882,15 @@ with tabs[3]:
             else:
                 st.error("Confirmation did not match. No delete.")
 
-    st.subheader("Dishes")
+    section_heading(
+        "Dishes",
+        "Dishes are reusable meals or recipes. Use override mode for manually known nutrition per serving. Leave override off for ingredient-based dishes that calculate nutrition from foods.",
+        level=3,
+    )
     with st.expander("Add / update dish"):
+        st.caption(
+            "Use this to create or update a dish shell. Example override: Tea = 70 kcal and 2g protein per serving. Example ingredient dish: Dal with final dish quantity 850 and unit g, then add ingredients below."
+        )
         dname = st.text_input("Dish name", key="add_dish_name")
         use_override = st.checkbox(
             "Use manual override values", key="add_dish_override"
@@ -955,7 +986,10 @@ with tabs[3]:
             else:
                 st.error("Dish name required.")
 
-    st.markdown("#### Edit a dish (overrides)")
+    section_heading(
+        "Edit a dish",
+        "Edit override nutrition or final cooked yield. For ingredient dishes, final dish quantity lets raw ingredient nutrition scale to cooked weight, e.g. ingredients produce 850g dal so logging 100g uses 100/850 of the recipe.",
+    )
     if not dishes.empty:
         dsel_edit = st.selectbox(
             "Select dish to edit",
@@ -1045,6 +1079,9 @@ with tabs[3]:
             st.rerun()
 
     with st.expander("Add ingredient to dish (for computed dishes)"):
+        st.caption(
+            "Add foods into an ingredient-based dish. Quantities are recipe quantities in the selected food unit. Example: 200g raw dal + 20g ghee + 500ml water."
+        )
         if dishes.empty or foods.empty:
             st.info("Add at least one dish and one food first.")
         else:
@@ -1077,7 +1114,10 @@ with tabs[3]:
                     st.success("Ingredient added and logs recalculated.")
                     st.rerun()
 
-    st.markdown("#### Edit ingredients of a dish")
+    section_heading(
+        "Edit ingredients",
+        "Adjust or remove the recipe ingredients for a computed dish. Any update recalculates logs for matching dish entries.",
+    )
     if not dishes.empty:
         dsel_ing = st.selectbox(
             "Select dish to manage ingredients",
@@ -1162,6 +1202,9 @@ with tabs[3]:
                         st.rerun()
 
     with st.expander("View dishes table", expanded=False):
+        st.caption(
+            "Preview calculated dish nutrition and basis. Basis is per serving for overrides or per final unit, such as per g, when a cooked yield is set."
+        )
         if dishes.empty:
             st.info("No dishes yet.")
         else:
@@ -1182,7 +1225,10 @@ with tabs[3]:
                 )
             st.dataframe(pd.DataFrame(preview), use_container_width=True)
 
-    st.markdown("#### Delete a dish")
+    section_heading(
+        "Delete a dish",
+        "Remove a dish, its ingredients, and any logged entries for that dish. Type the exact dish name before deleting.",
+    )
     if not dishes.empty:
         ddel = st.selectbox(
             "Select dish to delete",
@@ -1223,9 +1269,16 @@ with tabs[3]:
             else:
                 st.error("Confirmation did not match. No delete.")
 
-    st.subheader("Goals (advanced)")
+    section_heading(
+        "Goals",
+        "Goals are date-specific. Use single-date goals for one day, or bulk goals to prefill a date range. Past-date edits require the Day View toggle.",
+        level=3,
+    )
 
     with st.expander("Set or update goal for a single date"):
+        st.caption(
+            "Set one day's targets. Example: May 3 has 1800 kcal and 120g protein; changing May 3 does not change other days."
+        )
         day = st.date_input("Date for goal", value=date.today(), key="goal_date")
         cal_goal = st.number_input(
             "Calorie goal", min_value=0.0, step=50.0, value=1800.0, key="cal_goal2"
@@ -1243,6 +1296,9 @@ with tabs[3]:
                 st.rerun()
 
     with st.expander("Bulk set goals for a date range"):
+        st.caption(
+            "Apply the same goal across many dates. Example: set every weekday in a cut phase to 1700 kcal and 130g protein."
+        )
         r1, r2 = st.columns(2)
         with r1:
             start_day = st.date_input(
@@ -1284,9 +1340,15 @@ with tabs[3]:
                 st.rerun()
 
     with st.expander("View all goals", expanded=False):
+        st.caption(
+            "Read-only view of saved goal rows. Use Clear goals below if old test goals are cluttering this table."
+        )
         st.dataframe(goals.sort_values("date"), use_container_width=True)
 
     with st.expander("Clear goals", expanded=False):
+        st.caption(
+            "Deletes only goal rows. Foods, dishes, ingredients, and logs stay intact."
+        )
         st.warning(
             f"This will delete all {len(goals)} saved goal rows. Food, dish, and log data will stay untouched."
         )
@@ -1316,7 +1378,11 @@ with tabs[3]:
             else:
                 st.error("Confirmation did not match. Goals were not cleared.")
 
-    st.subheader("Danger zone")
+    section_heading(
+        "Danger zone",
+        "Use only when you want a fresh local database. Reset all data clears foods, dishes, ingredients, goals, and logs from the CSVs while keeping the files.",
+        level=3,
+    )
     with st.expander("Reset all data", expanded=False):
         st.warning(
             "This removes every food, dish, ingredient, goal, and log row from the local CSV files. The files and headers stay in place."

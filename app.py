@@ -17,6 +17,32 @@ DISH_ING_CSV = DATA_DIR / "dish_ingredients.csv"
 GOALS_CSV = DATA_DIR / "goals.csv"
 LOGS_CSV = DATA_DIR / "logs.csv"
 
+FOOD_COLUMNS = [
+    "food_name",
+    "unit",
+    "base_qty",
+    "calories_base",
+    "protein_base",
+    "cal_per_unit",
+    "protein_per_unit",
+]
+DISH_COLUMNS = [
+    "dish_name",
+    "cal_override",
+    "protein_override",
+    "servings",
+    "yield_qty",
+    "yield_unit",
+]
+DISH_INGREDIENT_COLUMNS = [
+    "dish_name",
+    "ingredient_food_name",
+    "ingredient_unit",
+    "ingredient_qty_per_serving",
+]
+GOAL_COLUMNS = ["date", "calorie_goal", "protein_goal"]
+LOG_COLUMNS = ["date", "meal", "type", "name", "unit", "qty", "calories", "protein"]
+
 # ---------- Utilities ----------
 
 
@@ -37,32 +63,12 @@ def ensure_csv(path: Path, columns: list):
 def load_all():
     foods = ensure_csv(
         # FOODS_CSV, ["food_name", "unit", "cal_per_unit", "protein_per_unit"]
-        FOODS_CSV, ["food_name", "unit", "base_qty", "calories_base", "protein_base", "cal_per_unit", "protein_per_unit"]
+        FOODS_CSV, FOOD_COLUMNS
     )
-    dishes = ensure_csv(
-        DISHES_CSV,
-        [
-            "dish_name",
-            "cal_override",
-            "protein_override",
-            "servings",
-            "yield_qty",
-            "yield_unit",
-        ],
-    )
-    dings = ensure_csv(
-        DISH_ING_CSV,
-        [
-            "dish_name",
-            "ingredient_food_name",
-            "ingredient_unit",
-            "ingredient_qty_per_serving",
-        ],
-    )
-    goals = ensure_csv(GOALS_CSV, ["date", "calorie_goal", "protein_goal"])
-    logs = ensure_csv(
-        LOGS_CSV, ["date", "meal", "type", "name", "unit", "qty", "calories", "protein"]
-    )
+    dishes = ensure_csv(DISHES_CSV, DISH_COLUMNS)
+    dings = ensure_csv(DISH_ING_CSV, DISH_INGREDIENT_COLUMNS)
+    goals = ensure_csv(GOALS_CSV, GOAL_COLUMNS)
+    logs = ensure_csv(LOGS_CSV, LOG_COLUMNS)
     # Coerce types
     for col in ["base_qty", "calories_base", "protein_base", "cal_per_unit", "protein_per_unit"]:
         if col in foods.columns:
@@ -84,6 +90,22 @@ def load_all():
 
 def save_df(df: pd.DataFrame, path: Path):
     df.to_csv(path, index=False)
+
+
+def empty_df(columns: list) -> pd.DataFrame:
+    return pd.DataFrame(columns=columns)
+
+
+def reset_csv(path: Path, columns: list):
+    empty_df(columns).to_csv(path, index=False)
+
+
+def reset_all_data():
+    reset_csv(FOODS_CSV, FOOD_COLUMNS)
+    reset_csv(DISHES_CSV, DISH_COLUMNS)
+    reset_csv(DISH_ING_CSV, DISH_INGREDIENT_COLUMNS)
+    reset_csv(GOALS_CSV, GOAL_COLUMNS)
+    reset_csv(LOGS_CSV, LOG_COLUMNS)
 
 
 def food_key(row) -> str:
@@ -155,6 +177,15 @@ def clear_add_dish_form():
 
 def set_view_date_today():
     st.session_state.view_date = date.today()
+
+
+def log_entry_label(idx, row) -> str:
+    return (
+        f"{idx}: {row['meal']} - {row['type']} - {row['name']} "
+        f"({as_float(row['qty'], 0.0):g} {row['unit']}, "
+        f"{as_float(row['calories'], 0.0):.0f} kcal, "
+        f"{as_float(row['protein'], 0.0):.1f}g protein)"
+    )
 
 
 def clear_session_keys(keys):
@@ -517,6 +548,31 @@ with tabs[1]:
                 }
             )
             st.dataframe(show, hide_index=True, use_container_width=True)
+
+        st.markdown("### Delete an entry")
+        delete_options = {
+            log_entry_label(idx, row): idx for idx, row in day_logs.iterrows()
+        }
+        delete_label = st.selectbox(
+            "Select entry to delete",
+            list(delete_options.keys()),
+            key="delete_day_log_sel",
+        )
+        confirm_delete_entry = st.text_input(
+            "Type DELETE ENTRY to confirm",
+            key="confirm_delete_day_log",
+        )
+        if st.button("Delete selected entry", key="delete_day_log_button"):
+            if confirm_delete_entry.strip() == "DELETE ENTRY":
+                delete_idx = delete_options[delete_label]
+                logs = logs.drop(delete_idx)
+                save_df(logs, LOGS_CSV)
+                clear_session_keys(["delete_day_log_sel", "confirm_delete_day_log"])
+                st.success("Entry deleted.")
+                st.rerun()
+            else:
+                st.error("Confirmation did not match. No entry was deleted.")
+
         tot_c, tot_p = daily_totals(logs, view_date)
         st.markdown("### Daily totals")
         m1, m2, m3 = st.columns(3)
@@ -1229,3 +1285,63 @@ with tabs[3]:
 
     with st.expander("View all goals", expanded=False):
         st.dataframe(goals.sort_values("date"), use_container_width=True)
+
+    with st.expander("Clear goals", expanded=False):
+        st.warning(
+            f"This will delete all {len(goals)} saved goal rows. Food, dish, and log data will stay untouched."
+        )
+        confirm_clear_goals = st.text_input(
+            "Type CLEAR GOALS to confirm",
+            key="confirm_clear_goals",
+        )
+        if st.button("Clear all goals", key="clear_goals_button"):
+            if confirm_clear_goals.strip() == "CLEAR GOALS":
+                goals = empty_df(GOAL_COLUMNS)
+                save_df(goals, GOALS_CSV)
+                clear_session_keys(
+                    [
+                        "confirm_clear_goals",
+                        "gcal_new",
+                        "gprot_new",
+                        "gcal_edit",
+                        "gprot_edit",
+                        "cal_goal2",
+                        "prot_goal2",
+                        "bulk_cal",
+                        "bulk_prot",
+                    ]
+                )
+                st.session_state.master_data_message = "All goals cleared."
+                st.rerun()
+            else:
+                st.error("Confirmation did not match. Goals were not cleared.")
+
+    st.subheader("Danger zone")
+    with st.expander("Reset all data", expanded=False):
+        st.warning(
+            "This removes every food, dish, ingredient, goal, and log row from the local CSV files. The files and headers stay in place."
+        )
+        st.write(
+            f"Current rows: {len(foods)} foods, {len(dishes)} dishes, {len(dings)} ingredients, {len(goals)} goals, {len(logs)} logs."
+        )
+        confirm_reset_all = st.text_input(
+            "Type RESET ALL DATA to confirm",
+            key="confirm_reset_all_data",
+        )
+        if st.button("Reset all data", key="reset_all_data_button"):
+            if confirm_reset_all.strip() == "RESET ALL DATA":
+                reset_all_data()
+                clear_session_keys(
+                    [
+                        "confirm_reset_all_data",
+                        "confirm_clear_goals",
+                        "confirm_food",
+                        "confirm_dish",
+                        "delete_day_log_sel",
+                        "confirm_delete_day_log",
+                    ]
+                )
+                st.session_state.master_data_message = "All local data reset."
+                st.rerun()
+            else:
+                st.error("Confirmation did not match. Data was not reset.")

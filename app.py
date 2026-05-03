@@ -4,7 +4,7 @@
 import streamlit as st
 import pandas as pd
 from pathlib import Path
-from datetime import date, datetime
+from datetime import date, timedelta
 from typing import Tuple
 
 if "allow_edit_past" not in st.session_state:
@@ -36,7 +36,8 @@ def ensure_csv(path: Path, columns: list):
 
 def load_all():
     foods = ensure_csv(
-        FOODS_CSV, ["food_name", "unit", "cal_per_unit", "protein_per_unit"]
+        # FOODS_CSV, ["food_name", "unit", "cal_per_unit", "protein_per_unit"]
+        FOODS_CSV, ["food_name", "unit", "base_qty", "calories_base", "protein_base", "cal_per_unit", "protein_per_unit"]
     )
     dishes = ensure_csv(
         DISHES_CSV, ["dish_name", "cal_override", "protein_override", "servings"]
@@ -55,7 +56,7 @@ def load_all():
         LOGS_CSV, ["date", "meal", "type", "name", "unit", "qty", "calories", "protein"]
     )
     # Coerce types
-    for col in ["cal_per_unit", "protein_per_unit"]:
+    for col in ["base_qty", "calories_base", "protein_base", "cal_per_unit", "protein_per_unit"]:
         if col in foods.columns:
             foods[col] = pd.to_numeric(foods[col], errors="coerce")
     for col in ["cal_override", "protein_override", "servings"]:
@@ -81,11 +82,59 @@ def food_key(row) -> str:
     return f"{row['food_name']} [{row['unit']}]"
 
 
+def as_float(value, default: float = 0.0) -> float:
+    if pd.isna(value):
+        return default
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return default
+
+
 def get_food_row(foods: pd.DataFrame, food_name: str, unit: str):
     m = (foods["food_name"] == food_name) & (foods["unit"] == unit)
     if not m.any():
         return None
     return foods[m].iloc[0]
+
+
+def normalize_food_row(row):
+    base_qty = as_float(row.get("base_qty"), 0.0)
+    cal_per_unit = as_float(row.get("cal_per_unit"), 0.0)
+    protein_per_unit = as_float(row.get("protein_per_unit"), 0.0)
+
+    if base_qty <= 0:
+        base_qty = 1.0
+
+    calories_base = row.get("calories_base")
+    protein_base = row.get("protein_base")
+    if pd.isna(calories_base):
+        calories_base = cal_per_unit * base_qty
+    if pd.isna(protein_base):
+        protein_base = protein_per_unit * base_qty
+
+    row["base_qty"] = base_qty
+    row["calories_base"] = as_float(calories_base, 0.0)
+    row["protein_base"] = as_float(protein_base, 0.0)
+    row["cal_per_unit"] = row["calories_base"] / base_qty
+    row["protein_per_unit"] = row["protein_base"] / base_qty
+    return row
+
+
+def clear_add_food_form():
+    st.session_state.add_food_name = ""
+    st.session_state.add_food_unit = ""
+    st.session_state.add_base_qty = 100.0
+    st.session_state.add_cal_base = 0.0
+    st.session_state.add_prot_base = 0.0
+
+
+def clear_add_dish_form():
+    st.session_state.add_dish_name = ""
+    st.session_state.add_dish_override = False
+    st.session_state.add_dish_cal = 0.0
+    st.session_state.add_dish_prot = 0.0
+    st.session_state.add_dish_servings = 1.0
 
 
 def compute_dish_base(
@@ -107,9 +156,9 @@ def compute_dish_base(
         frow = get_food_row(foods, ing["ingredient_food_name"], ing["ingredient_unit"])
         if frow is None:
             continue  # missing ingredient definition, skip
-        qty = float(ing["ingredient_qty_per_serving"] or 0)
-        total_c += qty * float(frow["cal_per_unit"] or 0)
-        total_p += qty * float(frow["protein_per_unit"] or 0)
+        qty = as_float(ing["ingredient_qty_per_serving"], 0.0)
+        total_c += qty * as_float(frow["cal_per_unit"], 0.0)
+        total_p += qty * as_float(frow["protein_per_unit"], 0.0)
     return total_c, total_p
 
 
@@ -160,8 +209,8 @@ def recalc_logs_for_food(
     frow = get_food_row(foods, food_name, unit)
     if frow is None:
         return logs
-    cal_per = float(frow["cal_per_unit"] or 0)
-    prot_per = float(frow["protein_per_unit"] or 0)
+    cal_per = as_float(frow["cal_per_unit"], 0.0)
+    prot_per = as_float(frow["protein_per_unit"], 0.0)
     mask = (
         (logs["type"] == "food") & (logs["name"] == food_name) & (logs["unit"] == unit)
     )
@@ -206,6 +255,9 @@ st.markdown(
 
 foods, dishes, dings, goals, logs = load_all()
 
+if not foods.empty:
+    foods = foods.apply(normalize_food_row, axis=1)
+
 st.title("Shoku 🍱")
 
 tabs = st.tabs(["Log", "Day View", "Dashboard", "Master Data"])
@@ -215,31 +267,40 @@ with tabs[0]:
     st.subheader("Add entry")
     c1, c2 = st.columns([1, 1])
     with c1:
-        log_date = st.date_input("Date", value=date.today())
-        meal = st.selectbox("Meal", ["Breakfast", "Lunch", "Dinner", "Snacks"], index=0)
-        entry_type = st.radio("Type", ["Food", "Dish"], horizontal=True)
+        log_date = st.date_input("Date", value=date.today(), key="log_date")
+        meal = st.selectbox(
+            "Meal", ["Breakfast", "Lunch", "Dinner", "Snacks"], index=0, key="log_meal"
+        )
+        entry_type = st.radio("Type", ["Food", "Dish"], horizontal=True, key="log_type")
     with c2:
-        qty = st.number_input("Quantity", min_value=0.0, step=1.0, value=1.0)
+        qty = st.number_input(
+            "Quantity", min_value=0.0, step=1.0, value=1.0, key="log_qty"
+        )
 
     if entry_type == "Food":
         food_names = sorted(foods["food_name"].unique().tolist())
         if not food_names:
             st.info("Add foods in Master Data first.")
         else:
-            f_name = st.selectbox("Food", food_names)
+            f_name = st.selectbox("Food", food_names, key="log_food_name")
             units = sorted(
                 foods[foods["food_name"] == f_name]["unit"].unique().tolist()
             )
-            unit = st.selectbox("Unit", units)
+            unit = st.selectbox("Unit", units, key="log_food_unit")
             frow = get_food_row(foods, f_name, unit)
             if frow is not None:
-                cal_per = float(frow["cal_per_unit"] or 0)
-                prot_per = float(frow["protein_per_unit"] or 0)
+                cal_per = as_float(frow["cal_per_unit"], 0.0)
+                prot_per = as_float(frow["protein_per_unit"], 0.0)
                 est_c = qty * cal_per
                 est_p = qty * prot_per
                 st.metric("Calories (est.)", f"{est_c:.0f}")
                 st.metric("Protein (g, est.)", f"{est_p:.1f}")
-                if st.button("Add to log", type="primary", use_container_width=True):
+                if st.button(
+                    "Add to log",
+                    type="primary",
+                    use_container_width=True,
+                    key="add_food_log",
+                ):
                     logs = add_log_entry(
                         logs, log_date, meal, "food", f_name, unit, qty, est_c, est_p
                     )
@@ -253,15 +314,8 @@ with tabs[0]:
         if not dish_names:
             st.info("Add dishes in Master Data first.")
         else:
-            d_name = st.selectbox("Dish", dish_names)
+            d_name = st.selectbox("Dish", dish_names, key="log_dish_name")
             base_c, base_p = compute_dish_base(d_name, dishes, dings, foods)
-            # servings
-            servings_row = dishes[dishes["dish_name"] == d_name]
-            per_serv = 1.0
-            if not servings_row.empty and pd.notna(
-                servings_row.iloc[0].get("servings")
-            ):
-                per_serv = float(servings_row.iloc[0]["servings"] or 1.0)
             # interpret qty as "servings"
             est_c = qty * base_c
             est_p = qty * base_p
@@ -269,7 +323,12 @@ with tabs[0]:
             st.metric("Protein per serving (g)", f"{base_p:.1f}")
             st.metric("Calories (this entry)", f"{est_c:.0f}")
             st.metric("Protein (this entry, g)", f"{est_p:.1f}")
-            if st.button("Add to log", type="primary", use_container_width=True):
+            if st.button(
+                "Add to log",
+                type="primary",
+                use_container_width=True,
+                key="add_dish_log",
+            ):
                 logs = add_log_entry(
                     logs, log_date, meal, "dish", d_name, "serving", qty, est_c, est_p
                 )
@@ -286,12 +345,11 @@ with tabs[1]:
         st.write("Daily goals")
 
         # single global toggle (controls all past edits)
-        st.session_state.allow_edit_past = st.checkbox(
+        allow = st.checkbox(
             "Allow editing past goals",
-            value=st.session_state.allow_edit_past,
             help="If off, past dates cannot be edited anywhere.",
+            key="allow_edit_past",
         )
-        allow = st.session_state.allow_edit_past
 
         gcal, gprot = get_goal_for_date(goals, view_date)
 
@@ -303,7 +361,9 @@ with tabs[1]:
                 "Protein goal", min_value=0.0, step=5.0, value=120.0, key="gprot_new"
             )
             disabled = view_date < date.today() and not allow
-            if st.button("Save goal for this date", disabled=disabled):
+            if st.button(
+                "Save goal for this date", disabled=disabled, key="save_day_goal"
+            ):
                 if disabled:
                     st.error("Editing past goals is disabled. Enable it above.")
                 else:
@@ -331,7 +391,7 @@ with tabs[1]:
                 key="gprot_edit",
             )
             disabled = view_date < date.today() and not allow
-            if st.button("Update goal", disabled=disabled):
+            if st.button("Update goal", disabled=disabled, key="update_day_goal"):
                 if disabled:
                     st.error("Editing past goals is disabled. Enable it above.")
                 else:
@@ -390,9 +450,16 @@ with tabs[2]:
         )
         goals_join = goals.rename(columns={"date": "date"})
         merged = pd.merge(agg, goals_join, on="date", how="left")
-        # Flags
-        merged["protein_met"] = merged["protein"] >= merged["protein_goal"]
-        merged["under_cal"] = merged["calories"] <= merged["calorie_goal"]
+        # Flags only apply to days that have both goals defined.
+        has_goals = merged["calorie_goal"].notna() & merged["protein_goal"].notna()
+        merged["protein_met"] = pd.NA
+        merged["under_cal"] = pd.NA
+        merged.loc[has_goals, "protein_met"] = (
+            merged.loc[has_goals, "protein"] >= merged.loc[has_goals, "protein_goal"]
+        )
+        merged.loc[has_goals, "under_cal"] = (
+            merged.loc[has_goals, "calories"] <= merged.loc[has_goals, "calorie_goal"]
+        )
         # Counts
         days_with_goals = merged.dropna(subset=["calorie_goal", "protein_goal"])
         c1, c2, c3 = st.columns(3)
@@ -412,20 +479,41 @@ with tabs[3]:
     with st.expander("Add food"):
         c1, c2, c3, c4 = st.columns(4)
         with c1:
-            f_name = st.text_input("Food name")
+            f_name = st.text_input("Food name", key="add_food_name")
         with c2:
-            unit = st.text_input("Unit (e.g., g, ml, pc, bowl, tbsp)")
+            unit = st.text_input("Unit (e.g., g, ml, pc, bowl, tbsp)", key="add_food_unit")
         with c3:
-            cal_per = st.number_input("Calories per unit", min_value=0.0, step=1.0)
+            base_qty = st.number_input("Base quantity", min_value=1.0, step=1.0, value=100.0, key="add_base_qty")
+            cal_base = st.number_input("Calories for base qty", min_value=0.0, step=1.0, key="add_cal_base")
         with c4:
-            prot_per = st.number_input("Protein per unit (g)", min_value=0.0, step=0.1)
-        if st.button("Save food"):
+            prot_base = st.number_input("Protein for base qty (g)", min_value=0.0, step=0.1, key="add_prot_base")
+
+        b1, b2 = st.columns(2)
+        with b1:
+            save_food = st.button("Save food", key="save_food")
+        with b2:
+            st.button("Clear form", key="clear_add_food", on_click=clear_add_food_form)
+
+        if save_food:
+            f_name = f_name.strip()
+            unit = unit.strip()
             if f_name and unit:
                 exists = (foods["food_name"] == f_name) & (foods["unit"] == unit)
                 if exists.any():
                     st.warning("Food with this unit already exists.")
                 else:
-                    foods.loc[len(foods)] = [f_name, unit, cal_per, prot_per]
+                    cal_per = cal_base / base_qty if base_qty > 0 else 0
+                    prot_per = prot_base / base_qty if base_qty > 0 else 0
+
+                    foods.loc[len(foods)] = [
+                        f_name,
+                        unit,
+                        base_qty,
+                        cal_base,
+                        prot_base,
+                        cal_per,
+                        prot_per,
+                    ]
                     save_df(foods, FOODS_CSV)
                     st.success("Food saved.")
                     st.rerun()
@@ -448,19 +536,28 @@ with tabs[3]:
 
         new_name = st.text_input("Food name", value=old_name, key="edit_food_name")
         new_unit = st.text_input("Unit", value=old_unit, key="edit_food_unit")
-        new_cal = st.number_input(
-            "Calories per unit",
+        new_base_qty = st.number_input(
+            "Base quantity",
+            min_value=1.0,
+            step=1.0,
+            value=float(frow["base_qty"]),
+            key="edit_base_qty",
+        )
+
+        new_cal_base = st.number_input(
+            "Calories for base qty",
             min_value=0.0,
             step=1.0,
-            value=float(frow["cal_per_unit"]),
-            key="edit_food_cal",
+            value=float(frow["calories_base"]),
+            key="edit_cal_base",
         )
-        new_prot = st.number_input(
-            "Protein per unit",
+
+        new_prot_base = st.number_input(
+            "Protein for base qty",
             min_value=0.0,
             step=0.1,
-            value=float(frow["protein_per_unit"]),
-            key="edit_food_prot",
+            value=float(frow["protein_base"]),
+            key="edit_prot_base",
         )
         propagate = st.checkbox(
             "Also update dish ingredients that reference this food",
@@ -469,8 +566,42 @@ with tabs[3]:
         )
 
         if st.button("Save changes to food", key="save_food_edit"):
+            new_name = new_name.strip()
+            new_unit = new_unit.strip()
+            duplicate = (
+                (foods.index != frow.name)
+                & (foods["food_name"] == new_name)
+                & (foods["unit"] == new_unit)
+            )
+            if not new_name or not new_unit:
+                st.error("Name and unit required.")
+                st.stop()
+            if duplicate.any():
+                st.error("Another food already uses this name and unit.")
+                st.stop()
+
+            impacted_before = sorted(
+                dings[
+                    (dings["ingredient_food_name"] == old_name)
+                    & (dings["ingredient_unit"] == old_unit)
+                ]["dish_name"]
+                .unique()
+                .tolist()
+            )
+
             # update foods table
-            foods.loc[frow.name] = [new_name, new_unit, new_cal, new_prot]
+            cal_per = new_cal_base / new_base_qty if new_base_qty > 0 else 0
+            prot_per = new_prot_base / new_base_qty if new_base_qty > 0 else 0
+
+            foods.loc[frow.name] = [
+                new_name,
+                new_unit,
+                new_base_qty,
+                new_cal_base,
+                new_prot_base,
+                cal_per,
+                prot_per,
+            ]
             save_df(foods, FOODS_CSV)
 
             # If name/unit changed, update existing food logs to new identifiers
@@ -494,7 +625,7 @@ with tabs[3]:
 
             # Recalculate logs that reference this food and any dishes that include it
             logs = recalc_logs_for_food(logs, foods, new_name, new_unit)
-            impacted = sorted(
+            impacted_after = sorted(
                 dings[
                     (dings["ingredient_food_name"] == new_name)
                     & (dings["ingredient_unit"] == new_unit)
@@ -502,6 +633,7 @@ with tabs[3]:
                 .unique()
                 .tolist()
             )
+            impacted = sorted(set(impacted_before) | set(impacted_after))
             if impacted:
                 logs = recalc_logs_for_dishes(logs, dishes, dings, foods, impacted)
             save_df(logs, LOGS_CSV)
@@ -509,10 +641,14 @@ with tabs[3]:
             st.success(f"Food {fedit} updated and logs recalculated.")
             st.rerun()
 
+
+
     st.markdown("#### Delete a food")
     if not foods.empty:
         fdel = st.selectbox(
-            "Select food to delete", foods.apply(food_key, axis=1).tolist()
+            "Select food to delete",
+            foods.apply(food_key, axis=1).tolist(),
+            key="delete_food_sel",
         )
 
         # Preview how many logs/ingredients will be affected
@@ -534,9 +670,15 @@ with tabs[3]:
         )
         if st.button("Delete food", key="delete_food_button"):
             if confirm_name.strip() == fdel:
+                impacted_dishes = sorted(affected_ings["dish_name"].unique().tolist())
                 logs = logs.drop(affected_logs.index)
                 dings = dings.drop(affected_ings.index)
                 foods = foods.drop(frow.name)
+
+                if impacted_dishes:
+                    logs = recalc_logs_for_dishes(
+                        logs, dishes, dings, foods, impacted_dishes
+                    )
 
                 save_df(foods, FOODS_CSV)
                 save_df(dings, DISH_ING_CSV)
@@ -548,15 +690,28 @@ with tabs[3]:
 
     st.subheader("Dishes")
     with st.expander("Add / update dish"):
-        dname = st.text_input("Dish name")
+        dname = st.text_input("Dish name", key="add_dish_name")
+        use_override = st.checkbox(
+            "Use manual override values", key="add_dish_override"
+        )
         col1, col2, col3 = st.columns(3)
         with col1:
             cal_o = st.number_input(
-                "Calorie override (optional)", min_value=0.0, step=1.0, value=0.0
+                "Calories per serving",
+                min_value=0.0,
+                step=1.0,
+                value=0.0,
+                disabled=not use_override,
+                key="add_dish_cal",
             )
         with col2:
             prot_o = st.number_input(
-                "Protein override (g, optional)", min_value=0.0, step=0.1, value=0.0
+                "Protein per serving (g)",
+                min_value=0.0,
+                step=0.1,
+                value=0.0,
+                disabled=not use_override,
+                key="add_dish_prot",
             )
         with col3:
             servings = st.number_input(
@@ -565,12 +720,20 @@ with tabs[3]:
                 step=1.0,
                 value=1.0,
                 help="Use 1 unless you need a different base serving size.",
+                key="add_dish_servings",
             )
-        if st.button("Save dish"):
+        b1, b2 = st.columns(2)
+        with b1:
+            save_dish = st.button("Save dish", key="save_dish")
+        with b2:
+            st.button("Clear form", key="clear_add_dish", on_click=clear_add_dish_form)
+
+        if save_dish:
+            dname = dname.strip()
             if dname:
                 exists = dishes["dish_name"] == dname
-                calv = cal_o if cal_o > 0 else None
-                protv = prot_o if prot_o > 0 else None
+                calv = cal_o if use_override else None
+                protv = prot_o if use_override else None
                 if exists.any():
                     idx = dishes.index[exists][0]
                     dishes.loc[
@@ -579,7 +742,9 @@ with tabs[3]:
                 else:
                     dishes.loc[len(dishes)] = [dname, calv, protv, servings]
                 save_df(dishes, DISHES_CSV)
-                st.success("Dish saved.")
+                logs = recalc_logs_for_dishes(logs, dishes, dings, foods, [dname])
+                save_df(logs, LOGS_CSV)
+                st.success("Dish saved and logs recalculated.")
                 st.rerun()
             else:
                 st.error("Dish name required.")
@@ -592,23 +757,30 @@ with tabs[3]:
             key="edit_dish_sel_unique",
         )
         drow = dishes[dishes["dish_name"] == dsel_edit].iloc[0]
+        edit_use_override = st.checkbox(
+            "Use manual override values",
+            value=pd.notna(drow["cal_override"]) and pd.notna(drow["protein_override"]),
+            key="edit_dish_override_unique",
+        )
 
         new_cal = st.number_input(
-            "Calorie override",
+            "Calories per serving",
             min_value=0.0,
             step=1.0,
             value=float(drow["cal_override"])
             if pd.notna(drow["cal_override"])
             else 0.0,
+            disabled=not edit_use_override,
             key="edit_dish_cal_unique",
         )
         new_prot = st.number_input(
-            "Protein override",
+            "Protein per serving",
             min_value=0.0,
             step=0.1,
             value=float(drow["protein_override"])
             if pd.notna(drow["protein_override"])
             else 0.0,
+            disabled=not edit_use_override,
             key="edit_dish_prot_unique",
         )
         new_serv = st.number_input(
@@ -622,8 +794,8 @@ with tabs[3]:
         if st.button("Save changes to dish", key="save_dish_edit_unique"):
             idx = drow.name
             dishes.loc[idx, ["cal_override", "protein_override", "servings"]] = [
-                new_cal if new_cal > 0 else None,
-                new_prot if new_prot > 0 else None,
+                new_cal if edit_use_override else None,
+                new_prot if edit_use_override else None,
                 new_serv,
             ]
             save_df(dishes, DISHES_CSV)
@@ -637,14 +809,24 @@ with tabs[3]:
         if dishes.empty or foods.empty:
             st.info("Add at least one dish and one food first.")
         else:
-            dsel = st.selectbox("Dish", sorted(dishes["dish_name"].tolist()))
+            dsel = st.selectbox(
+                "Dish", sorted(dishes["dish_name"].tolist()), key="add_ing_dish"
+            )
             fsel = st.selectbox(
-                "Ingredient food", sorted(foods["food_name"].unique().tolist())
+                "Ingredient food",
+                sorted(foods["food_name"].unique().tolist()),
+                key="add_ing_food",
             )
             units = sorted(foods[foods["food_name"] == fsel]["unit"].unique().tolist())
-            u_sel = st.selectbox("Ingredient unit", units)
-            qty = st.number_input("Qty per serving", min_value=0.0, step=1.0, value=0.0)
-            if st.button("Add ingredient"):
+            u_sel = st.selectbox("Ingredient unit", units, key="add_ing_unit")
+            qty = st.number_input(
+                "Qty per serving",
+                min_value=0.0,
+                step=1.0,
+                value=0.0,
+                key="add_ing_qty",
+            )
+            if st.button("Add ingredient", key="add_ing_button"):
                 if qty <= 0:
                     st.error("Quantity must be > 0.")
                 else:
@@ -759,7 +941,9 @@ with tabs[3]:
     st.markdown("#### Delete a dish")
     if not dishes.empty:
         ddel = st.selectbox(
-            "Select dish to delete", sorted(dishes["dish_name"].tolist())
+            "Select dish to delete",
+            sorted(dishes["dish_name"].tolist()),
+            key="delete_dish_sel",
         )
 
         affected_logs = logs[(logs["type"] == "dish") & (logs["name"] == ddel)]
@@ -795,7 +979,7 @@ with tabs[3]:
         prot_goal = st.number_input(
             "Protein goal", min_value=0.0, step=5.0, value=120.0, key="prot_goal2"
         )
-        if st.button("Save goal (single date)"):
+        if st.button("Save goal (single date)", key="save_single_goal"):
             if day < date.today() and not st.session_state.allow_edit_past:
                 st.error("Editing past goals is disabled. Enable it in Day View.")
             else:
@@ -829,7 +1013,7 @@ with tabs[3]:
             key="bulk_prot",
         )
 
-        if st.button("Apply to range"):
+        if st.button("Apply to range", key="apply_goal_range"):
             if end_day < start_day:
                 st.error("End date must be on or after start date.")
             elif (
@@ -838,8 +1022,6 @@ with tabs[3]:
                 st.error("Editing past goals is disabled. Enable it in Day View.")
             else:
                 cur = start_day
-                from datetime import timedelta
-
                 while cur <= end_day:
                     goals = upsert_goal(goals, cur, bcal, bprot)
                     cur += timedelta(days=1)

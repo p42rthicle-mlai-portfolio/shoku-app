@@ -40,7 +40,15 @@ def load_all():
         FOODS_CSV, ["food_name", "unit", "base_qty", "calories_base", "protein_base", "cal_per_unit", "protein_per_unit"]
     )
     dishes = ensure_csv(
-        DISHES_CSV, ["dish_name", "cal_override", "protein_override", "servings"]
+        DISHES_CSV,
+        [
+            "dish_name",
+            "cal_override",
+            "protein_override",
+            "servings",
+            "yield_qty",
+            "yield_unit",
+        ],
     )
     dings = ensure_csv(
         DISH_ING_CSV,
@@ -59,7 +67,7 @@ def load_all():
     for col in ["base_qty", "calories_base", "protein_base", "cal_per_unit", "protein_per_unit"]:
         if col in foods.columns:
             foods[col] = pd.to_numeric(foods[col], errors="coerce")
-    for col in ["cal_override", "protein_override", "servings"]:
+    for col in ["cal_override", "protein_override", "servings", "yield_qty"]:
         if col in dishes.columns:
             dishes[col] = pd.to_numeric(dishes[col], errors="coerce")
     for col in ["ingredient_qty_per_serving"]:
@@ -89,6 +97,12 @@ def as_float(value, default: float = 0.0) -> float:
         return float(value)
     except (TypeError, ValueError):
         return default
+
+
+def as_text(value) -> str:
+    if pd.isna(value):
+        return ""
+    return str(value).strip()
 
 
 def get_food_row(foods: pd.DataFrame, food_name: str, unit: str):
@@ -135,6 +149,36 @@ def clear_add_dish_form():
     st.session_state.add_dish_cal = 0.0
     st.session_state.add_dish_prot = 0.0
     st.session_state.add_dish_servings = 1.0
+    st.session_state.add_dish_yield_qty = 0.0
+    st.session_state.add_dish_yield_unit = ""
+
+
+def is_override_dish(row) -> bool:
+    return pd.notna(row.get("cal_override")) and pd.notna(row.get("protein_override"))
+
+
+def get_dish_yield(row) -> Tuple[float, str]:
+    yield_qty = as_float(row.get("yield_qty"), 0.0)
+    yield_unit = as_text(row.get("yield_unit"))
+    if yield_qty > 0 and yield_unit:
+        return yield_qty, yield_unit
+    return 0.0, ""
+
+
+def get_dish_log_unit(dish_name: str, dishes: pd.DataFrame) -> str:
+    md = dishes[dishes["dish_name"] == dish_name]
+    if md.empty:
+        return "serving"
+    row = md.iloc[0]
+    if is_override_dish(row):
+        return "serving"
+    _, yield_unit = get_dish_yield(row)
+    return yield_unit or "serving"
+
+
+def get_dish_basis_label(dish_name: str, dishes: pd.DataFrame) -> str:
+    unit = get_dish_log_unit(dish_name, dishes)
+    return f"per {unit}"
 
 
 def compute_dish_base(
@@ -146,7 +190,7 @@ def compute_dish_base(
     if md.empty:
         return 0.0, 0.0
     row = md.iloc[0]
-    if pd.notna(row.get("cal_override")) and pd.notna(row.get("protein_override")):
+    if is_override_dish(row):
         return float(row["cal_override"]), float(row["protein_override"])
     # Sum ingredients
     use = dings[dings["dish_name"] == dish_name]
@@ -159,6 +203,9 @@ def compute_dish_base(
         qty = as_float(ing["ingredient_qty_per_serving"], 0.0)
         total_c += qty * as_float(frow["cal_per_unit"], 0.0)
         total_p += qty * as_float(frow["protein_per_unit"], 0.0)
+    yield_qty, _ = get_dish_yield(row)
+    if yield_qty > 0:
+        return total_c / yield_qty, total_p / yield_qty
     return total_c, total_p
 
 
@@ -229,7 +276,12 @@ def recalc_logs_for_dishes(
 ) -> pd.DataFrame:
     for dn in dish_names:
         base_c, base_p = compute_dish_base(dn, dishes, dings, foods)
-        mask = (logs["type"] == "dish") & (logs["name"] == dn)
+        log_unit = get_dish_log_unit(dn, dishes)
+        mask = (
+            (logs["type"] == "dish")
+            & (logs["name"] == dn)
+            & (logs["unit"] == log_unit)
+        )
         qty = logs.loc[mask, "qty"].fillna(0).astype(float)
         logs.loc[mask, "calories"] = qty * base_c
         logs.loc[mask, "protein"] = qty * base_p
@@ -316,11 +368,12 @@ with tabs[0]:
         else:
             d_name = st.selectbox("Dish", dish_names, key="log_dish_name")
             base_c, base_p = compute_dish_base(d_name, dishes, dings, foods)
-            # interpret qty as "servings"
+            log_unit = get_dish_log_unit(d_name, dishes)
+            basis_label = get_dish_basis_label(d_name, dishes)
             est_c = qty * base_c
             est_p = qty * base_p
-            st.metric("Calories per serving", f"{base_c:.0f}")
-            st.metric("Protein per serving (g)", f"{base_p:.1f}")
+            st.metric(f"Calories {basis_label}", f"{base_c:.1f}")
+            st.metric(f"Protein {basis_label} (g)", f"{base_p:.2f}")
             st.metric("Calories (this entry)", f"{est_c:.0f}")
             st.metric("Protein (this entry, g)", f"{est_p:.1f}")
             if st.button(
@@ -330,7 +383,7 @@ with tabs[0]:
                 key="add_dish_log",
             ):
                 logs = add_log_entry(
-                    logs, log_date, meal, "dish", d_name, "serving", qty, est_c, est_p
+                    logs, log_date, meal, "dish", d_name, log_unit, qty, est_c, est_p
                 )
                 save_df(logs, LOGS_CSV)
                 st.success("Entry added.")
@@ -694,7 +747,7 @@ with tabs[3]:
         use_override = st.checkbox(
             "Use manual override values", key="add_dish_override"
         )
-        col1, col2, col3 = st.columns(3)
+        col1, col2, col3, col4 = st.columns(4)
         with col1:
             cal_o = st.number_input(
                 "Calories per serving",
@@ -722,6 +775,22 @@ with tabs[3]:
                 help="Use 1 unless you need a different base serving size.",
                 key="add_dish_servings",
             )
+        with col4:
+            yield_qty = st.number_input(
+                "Final dish quantity",
+                min_value=0.0,
+                step=1.0,
+                value=0.0,
+                disabled=use_override,
+                help="Optional cooked/output quantity for ingredient dishes, e.g. 850.",
+                key="add_dish_yield_qty",
+            )
+            yield_unit = st.text_input(
+                "Final dish unit",
+                disabled=use_override,
+                help="Optional output unit, e.g. g. No unit conversion is applied.",
+                key="add_dish_yield_unit",
+            )
         b1, b2 = st.columns(2)
         with b1:
             save_dish = st.button("Save dish", key="save_dish")
@@ -730,17 +799,37 @@ with tabs[3]:
 
         if save_dish:
             dname = dname.strip()
+            yield_unit = yield_unit.strip()
             if dname:
+                if not use_override and yield_qty > 0 and not yield_unit:
+                    st.error("Final dish unit is required when final dish quantity is set.")
+                    st.stop()
                 exists = dishes["dish_name"] == dname
                 calv = cal_o if use_override else None
                 protv = prot_o if use_override else None
+                yieldv = yield_qty if not use_override and yield_qty > 0 else None
+                yield_unitv = yield_unit if yieldv is not None else None
                 if exists.any():
                     idx = dishes.index[exists][0]
                     dishes.loc[
-                        idx, ["cal_override", "protein_override", "servings"]
-                    ] = [calv, protv, servings]
+                        idx,
+                        [
+                            "cal_override",
+                            "protein_override",
+                            "servings",
+                            "yield_qty",
+                            "yield_unit",
+                        ],
+                    ] = [calv, protv, servings, yieldv, yield_unitv]
                 else:
-                    dishes.loc[len(dishes)] = [dname, calv, protv, servings]
+                    dishes.loc[len(dishes)] = [
+                        dname,
+                        calv,
+                        protv,
+                        servings,
+                        yieldv,
+                        yield_unitv,
+                    ]
                 save_df(dishes, DISHES_CSV)
                 logs = recalc_logs_for_dishes(logs, dishes, dings, foods, [dname])
                 save_df(logs, LOGS_CSV)
@@ -790,13 +879,46 @@ with tabs[3]:
             value=float(drow["servings"]) if pd.notna(drow["servings"]) else 1.0,
             key="edit_dish_serv_unique",
         )
+        edit_yield_qty = st.number_input(
+            "Final dish quantity",
+            min_value=0.0,
+            step=1.0,
+            value=as_float(drow.get("yield_qty"), 0.0),
+            disabled=edit_use_override,
+            help="Optional cooked/output quantity for ingredient dishes.",
+            key="edit_dish_yield_qty_unique",
+        )
+        edit_yield_unit = st.text_input(
+            "Final dish unit",
+            value=as_text(drow.get("yield_unit")),
+            disabled=edit_use_override,
+            help="Optional output unit, e.g. g. No unit conversion is applied.",
+            key="edit_dish_yield_unit_unique",
+        )
 
         if st.button("Save changes to dish", key="save_dish_edit_unique"):
+            edit_yield_unit = edit_yield_unit.strip()
+            if not edit_use_override and edit_yield_qty > 0 and not edit_yield_unit:
+                st.error("Final dish unit is required when final dish quantity is set.")
+                st.stop()
+            yieldv = edit_yield_qty if not edit_use_override and edit_yield_qty > 0 else None
+            yield_unitv = edit_yield_unit if yieldv is not None else None
             idx = drow.name
-            dishes.loc[idx, ["cal_override", "protein_override", "servings"]] = [
+            dishes.loc[
+                idx,
+                [
+                    "cal_override",
+                    "protein_override",
+                    "servings",
+                    "yield_qty",
+                    "yield_unit",
+                ],
+            ] = [
                 new_cal if edit_use_override else None,
                 new_prot if edit_use_override else None,
                 new_serv,
+                yieldv,
+                yield_unitv,
             ]
             save_df(dishes, DISHES_CSV)
             # Recalculate all logs for this dish
@@ -820,7 +942,7 @@ with tabs[3]:
             units = sorted(foods[foods["food_name"] == fsel]["unit"].unique().tolist())
             u_sel = st.selectbox("Ingredient unit", units, key="add_ing_unit")
             qty = st.number_input(
-                "Qty per serving",
+                "Ingredient qty in recipe",
                 min_value=0.0,
                 step=1.0,
                 value=0.0,
@@ -889,7 +1011,7 @@ with tabs[3]:
                     )
                 with fcol3:
                     qty_choice = st.number_input(
-                        "Qty per serving",
+                        "Ingredient qty in recipe",
                         min_value=0.0,
                         step=1.0,
                         value=float(ing["ingredient_qty_per_serving"]),
@@ -929,11 +1051,16 @@ with tabs[3]:
         preview = []
         for dname in sorted(dishes["dish_name"].tolist()):
             base_c, base_p = compute_dish_base(dname, dishes, dings, foods)
+            drow = dishes[dishes["dish_name"] == dname].iloc[0]
+            yield_qty, yield_unit = get_dish_yield(drow)
             preview.append(
                 {
                     "dish_name": dname,
-                    "calories_per_serving": round(base_c, 1),
-                    "protein_per_serving": round(base_p, 1),
+                    "basis": get_dish_basis_label(dname, dishes),
+                    "final_qty": yield_qty if yield_qty > 0 else "",
+                    "final_unit": yield_unit,
+                    "calories": round(base_c, 2),
+                    "protein": round(base_p, 2),
                 }
             )
         st.dataframe(pd.DataFrame(preview), use_container_width=True)

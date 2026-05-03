@@ -153,6 +153,41 @@ def clear_add_dish_form():
     st.session_state.add_dish_yield_unit = ""
 
 
+def set_view_date_today():
+    st.session_state.view_date = date.today()
+
+
+def render_status_pie(calories_ok: bool, protein_ok: bool):
+    green = "#2e7d32"
+    red = "#c62828"
+    ok_count = int(calories_ok) + int(protein_ok)
+    if ok_count == 2:
+        gradient = f"{green} 0 100%"
+    elif ok_count == 1:
+        gradient = f"{green} 0 50%, {red} 50% 100%"
+    else:
+        gradient = f"{red} 0 100%"
+
+    st.markdown(
+        f"""
+        <div style="display:flex;align-items:center;gap:12px;margin-top:4px;">
+            <div aria-label="Daily status pie chart" style="
+                width:64px;
+                height:64px;
+                border-radius:50%;
+                background:conic-gradient({gradient});
+                border:1px solid rgba(0,0,0,0.12);
+            "></div>
+            <div style="font-size:0.85rem;line-height:1.35;">
+                <div><span style="color:{green};font-weight:700;">Green</span>: goal met</div>
+                <div><span style="color:{red};font-weight:700;">Red</span>: needs attention</div>
+            </div>
+        </div>
+        """,
+        unsafe_allow_html=True,
+    )
+
+
 def is_override_dish(row) -> bool:
     return pd.notna(row.get("cal_override")) and pd.notna(row.get("protein_override"))
 
@@ -393,6 +428,7 @@ with tabs[1]:
     st.subheader("Browse a day")
     colA, colB = st.columns([1, 1])
     with colA:
+        st.button("Today", key="view_today", on_click=set_view_date_today)
         view_date = st.date_input("Pick a date", value=date.today(), key="view_date")
     with colB:
         st.write("Daily goals")
@@ -484,10 +520,25 @@ with tabs[1]:
         if gcal is not None and gprot is not None:
             ok_c = tot_c <= gcal
             ok_p = tot_p >= gprot
-            m3.metric(
-                "Status",
-                f"{'Under calories' if ok_c else 'Over calories'} | {'Protein met' if ok_p else 'Protein not met'}",
+            status_color = "#2e7d32" if ok_c and ok_p else "#c62828"
+            status_text = (
+                f"{'Under calories' if ok_c else 'Over calories'} | "
+                f"{'Protein met' if ok_p else 'Protein not met'}"
             )
+            m3.markdown(
+                f"""
+                <div style="font-size:0.78rem;text-transform:uppercase;letter-spacing:0.04em;color:#666;">
+                    Status
+                </div>
+                <div style="font-size:0.95rem;font-weight:700;color:{status_color};line-height:1.35;">
+                    {status_text}
+                </div>
+                """,
+                unsafe_allow_html=True,
+            )
+            m3.caption("Daily goal status")
+            with m3:
+                render_status_pie(ok_c, ok_p)
 
 # --------- Tab 3: Dashboard ---------
 with tabs[2]:

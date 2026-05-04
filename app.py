@@ -1429,179 +1429,181 @@ with tabs[3]:
             foods.assign(key=foods.apply(food_key, axis=1)), use_container_width=True
         )
 
-    section_heading(
-        "Edit a food",
-        "Change a food's name, unit, or nutrition values. Existing food logs are recalculated. If this food is used in dishes, keep propagation on when you are renaming the food or unit.",
-    )
     if not foods.empty:
-        fedit = st.selectbox(
-            "Select food to edit",
-            foods.apply(food_key, axis=1).tolist(),
-            key="edit_food_sel",
+        section_heading(
+            "Edit a food",
+            "Change a food's name, unit, or nutrition values. Existing food logs are recalculated. If this food is used in dishes, keep propagation on when you are renaming the food or unit.",
         )
-        frow = foods[foods.apply(food_key, axis=1) == fedit].iloc[0]
-        old_name, old_unit = frow["food_name"], frow["unit"]
-        if st.session_state.get("edit_food_loaded_for") != fedit:
-            st.session_state.edit_food_name = old_name
-            st.session_state.edit_food_unit = old_unit
-            st.session_state.edit_base_qty = float(frow["base_qty"])
-            st.session_state.edit_cal_base = float(frow["calories_base"])
-            st.session_state.edit_prot_base = float(frow["protein_base"])
-            st.session_state.edit_food_propagate = True
-            st.session_state.edit_food_loaded_for = fedit
-
-        new_name = st.text_input("Food name", key="edit_food_name")
-        new_unit = st.text_input("Unit", key="edit_food_unit")
-        new_base_qty = st.number_input(
-            "Base quantity",
-            min_value=1.0,
-            step=1.0,
-            key="edit_base_qty",
-        )
-
-        new_cal_base = st.number_input(
-            "Calories for base qty",
-            min_value=0.0,
-            step=1.0,
-            key="edit_cal_base",
-        )
-
-        new_prot_base = st.number_input(
-            "Protein for base qty",
-            min_value=0.0,
-            step=0.1,
-            key="edit_prot_base",
-        )
-        propagate = st.checkbox(
-            "Also update dish ingredients that reference this food",
-            key="edit_food_propagate",
-        )
-
-        if st.button("Save changes to food", key="save_food_edit"):
-            new_name = new_name.strip()
-            new_unit = new_unit.strip()
-            duplicate = (
-                (foods.index != frow.name)
-                & (foods["food_name"] == new_name)
-                & (foods["unit"] == new_unit)
+        with st.expander("Edit a food", expanded=False):
+            fedit = st.selectbox(
+                "Select food to edit",
+                foods.apply(food_key, axis=1).tolist(),
+                key="edit_food_sel",
             )
-            if not new_name or not new_unit:
-                st.error("Name and unit required.")
-                st.stop()
-            if duplicate.any():
-                st.error("Another food already uses this name and unit.")
-                st.stop()
+            frow = foods[foods.apply(food_key, axis=1) == fedit].iloc[0]
+            old_name, old_unit = frow["food_name"], frow["unit"]
+            if st.session_state.get("edit_food_loaded_for") != fedit:
+                st.session_state.edit_food_name = old_name
+                st.session_state.edit_food_unit = old_unit
+                st.session_state.edit_base_qty = float(frow["base_qty"])
+                st.session_state.edit_cal_base = float(frow["calories_base"])
+                st.session_state.edit_prot_base = float(frow["protein_base"])
+                st.session_state.edit_food_propagate = True
+                st.session_state.edit_food_loaded_for = fedit
 
-            impacted_before = sorted(
-                dings[
-                    (dings["ingredient_food_name"] == old_name)
-                    & (dings["ingredient_unit"] == old_unit)
-                ]["dish_name"]
-                .unique()
-                .tolist()
+            new_name = st.text_input("Food name", key="edit_food_name")
+            new_unit = st.text_input("Unit", key="edit_food_unit")
+            new_base_qty = st.number_input(
+                "Base quantity",
+                min_value=1.0,
+                step=1.0,
+                key="edit_base_qty",
             )
 
-            # update foods table
-            cal_per = new_cal_base / new_base_qty if new_base_qty > 0 else 0
-            prot_per = new_prot_base / new_base_qty if new_base_qty > 0 else 0
+            new_cal_base = st.number_input(
+                "Calories for base qty",
+                min_value=0.0,
+                step=1.0,
+                key="edit_cal_base",
+            )
 
-            foods.loc[frow.name] = [
-                new_name,
-                new_unit,
-                new_base_qty,
-                new_cal_base,
-                new_prot_base,
-                cal_per,
-                prot_per,
-            ]
-            save_df(foods, FOODS_CSV)
+            new_prot_base = st.number_input(
+                "Protein for base qty",
+                min_value=0.0,
+                step=0.1,
+                key="edit_prot_base",
+            )
+            propagate = st.checkbox(
+                "Also update dish ingredients that reference this food",
+                key="edit_food_propagate",
+            )
 
-            # If name/unit changed, update existing food logs to new identifiers
-            if new_name != old_name or new_unit != old_unit:
-                mask_logs = (
-                    (logs["type"] == "food")
-                    & (logs["name"] == old_name)
-                    & (logs["unit"] == old_unit)
+            if st.button("Save changes to food", key="save_food_edit"):
+                new_name = new_name.strip()
+                new_unit = new_unit.strip()
+                duplicate = (
+                    (foods.index != frow.name)
+                    & (foods["food_name"] == new_name)
+                    & (foods["unit"] == new_unit)
                 )
-                logs.loc[mask_logs, ["name", "unit"]] = [new_name, new_unit]
+                if not new_name or not new_unit:
+                    st.error("Name and unit required.")
+                    st.stop()
+                if duplicate.any():
+                    st.error("Another food already uses this name and unit.")
+                    st.stop()
 
-            # Optionally propagate to dish ingredients
-            if propagate and (new_name != old_name or new_unit != old_unit):
-                mask = (dings["ingredient_food_name"] == old_name) & (
-                    dings["ingredient_unit"] == old_unit
+                impacted_before = sorted(
+                    dings[
+                        (dings["ingredient_food_name"] == old_name)
+                        & (dings["ingredient_unit"] == old_unit)
+                    ]["dish_name"]
+                    .unique()
+                    .tolist()
                 )
-                dings.loc[mask, "ingredient_food_name"] = new_name
-                dings.loc[mask, "ingredient_unit"] = new_unit
-                save_df(dings, DISH_ING_CSV)
-                st.success("References updated.")
 
-            # Recalculate logs that reference this food and any dishes that include it
-            logs = recalc_logs_for_food(logs, foods, new_name, new_unit)
-            impacted_after = sorted(
-                dings[
-                    (dings["ingredient_food_name"] == new_name)
-                    & (dings["ingredient_unit"] == new_unit)
-                ]["dish_name"]
-                .unique()
-                .tolist()
-            )
-            impacted = sorted(set(impacted_before) | set(impacted_after))
-            if impacted:
-                logs = recalc_logs_for_dishes(logs, dishes, dings, foods, impacted)
-            save_df(logs, LOGS_CSV)
+                # update foods table
+                cal_per = new_cal_base / new_base_qty if new_base_qty > 0 else 0
+                prot_per = new_prot_base / new_base_qty if new_base_qty > 0 else 0
 
-            st.success(f"Food {fedit} updated and logs recalculated.")
-            st.rerun()
-
-
-
-    section_heading(
-        "Delete a food",
-        "Remove a food definition. This also deletes direct food logs for that food and removes matching ingredient references from dishes. Type the exact food key before deleting.",
-    )
-    if not foods.empty:
-        fdel = st.selectbox(
-            "Select food to delete",
-            foods.apply(food_key, axis=1).tolist(),
-            key="delete_food_sel",
-        )
-
-        # Preview how many logs/ingredients will be affected
-        frow = foods[foods.apply(food_key, axis=1) == fdel].iloc[0]
-        fname, funit = frow["food_name"], frow["unit"]
-        affected_logs = logs[
-            (logs["type"] == "food") & (logs["name"] == fname) & (logs["unit"] == funit)
-        ]
-        affected_ings = dings[
-            (dings["ingredient_food_name"] == fname)
-            & (dings["ingredient_unit"] == funit)
-        ]
-        st.warning(
-            f"Deleting **{fdel}** will remove {len(affected_logs)} log entries and {len(affected_ings)} dish ingredient references."
-        )
-
-        confirm_name = st.text_input(
-            "Type the exact food name+unit to confirm", key="confirm_food"
-        )
-        if st.button("Delete food", key="delete_food_button"):
-            if confirm_name.strip() == fdel:
-                impacted_dishes = sorted(affected_ings["dish_name"].unique().tolist())
-                logs = logs.drop(affected_logs.index)
-                dings = dings.drop(affected_ings.index)
-                foods = foods.drop(frow.name)
-
-                if impacted_dishes:
-                    logs = recalc_logs_for_dishes(
-                        logs, dishes, dings, foods, impacted_dishes
-                    )
-
+                foods.loc[frow.name] = [
+                    new_name,
+                    new_unit,
+                    new_base_qty,
+                    new_cal_base,
+                    new_prot_base,
+                    cal_per,
+                    prot_per,
+                ]
                 save_df(foods, FOODS_CSV)
-                save_df(dings, DISH_ING_CSV)
+
+                # If name/unit changed, update existing food logs to new identifiers
+                if new_name != old_name or new_unit != old_unit:
+                    mask_logs = (
+                        (logs["type"] == "food")
+                        & (logs["name"] == old_name)
+                        & (logs["unit"] == old_unit)
+                    )
+                    logs.loc[mask_logs, ["name", "unit"]] = [new_name, new_unit]
+
+                # Optionally propagate to dish ingredients
+                if propagate and (new_name != old_name or new_unit != old_unit):
+                    mask = (dings["ingredient_food_name"] == old_name) & (
+                        dings["ingredient_unit"] == old_unit
+                    )
+                    dings.loc[mask, "ingredient_food_name"] = new_name
+                    dings.loc[mask, "ingredient_unit"] = new_unit
+                    save_df(dings, DISH_ING_CSV)
+                    st.success("References updated.")
+
+                # Recalculate logs that reference this food and any dishes that include it
+                logs = recalc_logs_for_food(logs, foods, new_name, new_unit)
+                impacted_after = sorted(
+                    dings[
+                        (dings["ingredient_food_name"] == new_name)
+                        & (dings["ingredient_unit"] == new_unit)
+                    ]["dish_name"]
+                    .unique()
+                    .tolist()
+                )
+                impacted = sorted(set(impacted_before) | set(impacted_after))
+                if impacted:
+                    logs = recalc_logs_for_dishes(logs, dishes, dings, foods, impacted)
                 save_df(logs, LOGS_CSV)
-                st.success(f"Deleted food {fdel}")
+
+                st.success(f"Food {fedit} updated and logs recalculated.")
                 st.rerun()
-            else:
-                st.error("Confirmation did not match. No delete.")
+
+    if not foods.empty:
+        section_heading(
+            "Delete a food",
+            "Remove a food definition. This also deletes direct food logs for that food and removes matching ingredient references from dishes. Type the exact food key before deleting.",
+        )
+        with st.expander("Delete a food", expanded=False):
+            fdel = st.selectbox(
+                "Select food to delete",
+                foods.apply(food_key, axis=1).tolist(),
+                key="delete_food_sel",
+            )
+
+            # Preview how many logs/ingredients will be affected
+            frow = foods[foods.apply(food_key, axis=1) == fdel].iloc[0]
+            fname, funit = frow["food_name"], frow["unit"]
+            affected_logs = logs[
+                (logs["type"] == "food")
+                & (logs["name"] == fname)
+                & (logs["unit"] == funit)
+            ]
+            affected_ings = dings[
+                (dings["ingredient_food_name"] == fname)
+                & (dings["ingredient_unit"] == funit)
+            ]
+            st.warning(
+                f"Deleting **{fdel}** will remove {len(affected_logs)} log entries and {len(affected_ings)} dish ingredient references."
+            )
+
+            confirm_name = st.text_input(
+                "Type the exact food name+unit to confirm", key="confirm_food"
+            )
+            if st.button("Delete food", key="delete_food_button"):
+                if confirm_name.strip() == fdel:
+                    impacted_dishes = sorted(affected_ings["dish_name"].unique().tolist())
+                    logs = logs.drop(affected_logs.index)
+                    dings = dings.drop(affected_ings.index)
+                    foods = foods.drop(frow.name)
+
+                    if impacted_dishes:
+                        logs = recalc_logs_for_dishes(
+                            logs, dishes, dings, foods, impacted_dishes
+                        )
+
+                    save_df(foods, FOODS_CSV)
+                    save_df(dings, DISH_ING_CSV)
+                    save_df(logs, LOGS_CSV)
+                    st.success(f"Deleted food {fdel}")
+                    st.rerun()
+                else:
+                    st.error("Confirmation did not match. No delete.")
 
     section_heading(
         "Dishes",

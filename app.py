@@ -1432,14 +1432,21 @@ with tabs[3]:
         )
         frow = foods[foods.apply(food_key, axis=1) == fedit].iloc[0]
         old_name, old_unit = frow["food_name"], frow["unit"]
+        if st.session_state.get("edit_food_loaded_for") != fedit:
+            st.session_state.edit_food_name = old_name
+            st.session_state.edit_food_unit = old_unit
+            st.session_state.edit_base_qty = float(frow["base_qty"])
+            st.session_state.edit_cal_base = float(frow["calories_base"])
+            st.session_state.edit_prot_base = float(frow["protein_base"])
+            st.session_state.edit_food_propagate = True
+            st.session_state.edit_food_loaded_for = fedit
 
-        new_name = st.text_input("Food name", value=old_name, key="edit_food_name")
-        new_unit = st.text_input("Unit", value=old_unit, key="edit_food_unit")
+        new_name = st.text_input("Food name", key="edit_food_name")
+        new_unit = st.text_input("Unit", key="edit_food_unit")
         new_base_qty = st.number_input(
             "Base quantity",
             min_value=1.0,
             step=1.0,
-            value=float(frow["base_qty"]),
             key="edit_base_qty",
         )
 
@@ -1447,7 +1454,6 @@ with tabs[3]:
             "Calories for base qty",
             min_value=0.0,
             step=1.0,
-            value=float(frow["calories_base"]),
             key="edit_cal_base",
         )
 
@@ -1455,12 +1461,10 @@ with tabs[3]:
             "Protein for base qty",
             min_value=0.0,
             step=0.1,
-            value=float(frow["protein_base"]),
             key="edit_prot_base",
         )
         propagate = st.checkbox(
             "Also update dish ingredients that reference this food",
-            value=True,
             key="edit_food_propagate",
         )
 

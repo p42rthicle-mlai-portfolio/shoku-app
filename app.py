@@ -465,27 +465,64 @@ def normalize_food_row(row):
 
 
 def clear_add_food_form():
-    st.session_state.add_food_name = ""
-    st.session_state.add_food_unit = ""
-    st.session_state.add_base_qty = 100.0
-    st.session_state.add_cal_base = 0.0
-    st.session_state.add_prot_base = 0.0
+    clear_session_keys(
+        [
+            "add_food_name",
+            "add_food_unit",
+            "add_base_qty",
+            "add_cal_base",
+            "add_prot_base",
+        ]
+    )
 
 
 def clear_add_dish_form():
-    st.session_state.add_dish_name = ""
-    st.session_state.add_dish_override = False
-    st.session_state.add_dish_cal = 0.0
-    st.session_state.add_dish_prot = 0.0
-    st.session_state.add_dish_servings = 1.0
-    st.session_state.add_dish_yield_qty = 0.0
-    st.session_state.add_dish_yield_unit = ""
+    clear_session_keys(
+        [
+            "add_dish_name",
+            "add_dish_override",
+            "add_dish_cal",
+            "add_dish_prot",
+            "add_dish_servings",
+            "add_dish_yield_qty",
+            "add_dish_yield_unit",
+        ]
+    )
 
 
 def clear_create_batch_form():
     for key in list(st.session_state.keys()):
         if key.startswith("create_batch_"):
             st.session_state.pop(key, None)
+
+
+def clear_log_form():
+    clear_session_keys(
+        [
+            "log_date",
+            "log_meal",
+            "log_type",
+            "log_qty",
+            "log_food_name",
+            "log_food_unit",
+            "log_dish_name",
+            "log_dish_basis",
+            "log_batch_sel",
+            "log_batch_basis",
+        ]
+    )
+
+
+def clear_add_ingredient_form():
+    clear_session_keys(["add_ing_food", "add_ing_unit", "add_ing_qty"])
+
+
+def clear_single_goal_form():
+    clear_session_keys(["goal_date", "cal_goal2", "prot_goal2"])
+
+
+def clear_bulk_goal_form():
+    clear_session_keys(["bulk_start", "bulk_end", "bulk_cal", "bulk_prot"])
 
 
 def set_view_date_today():
@@ -854,6 +891,9 @@ tabs = st.tabs(["Log", "Day View", "Dashboard", "Master Data"])
 
 # --------- Tab 1: Log ---------
 with tabs[0]:
+    log_message = st.session_state.pop("log_message", None)
+    if log_message:
+        st.success(log_message)
     st.subheader("Add entry")
     c1, c2 = st.columns([1, 1])
     with c1:
@@ -900,7 +940,9 @@ with tabs[0]:
                         logs, log_date, meal, "food", f_name, unit, qty, est_c, est_p
                     )
                     save_df(logs, LOGS_CSV)
-                    st.success("Entry added.")
+                    clear_log_form()
+                    st.session_state.log_message = "Entry added."
+                    st.rerun()
             else:
                 st.warning("Food+unit not found.")
 
@@ -964,7 +1006,9 @@ with tabs[0]:
                     logs, log_date, meal, "dish", d_name, log_unit, qty, est_c, est_p
                 )
                 save_df(logs, LOGS_CSV)
-                st.success("Entry added.")
+                clear_log_form()
+                st.session_state.log_message = "Entry added."
+                st.rerun()
     else:  # Batch
         if batches.empty:
             st.info("Create a batch in Master Data first.")
@@ -1043,7 +1087,9 @@ with tabs[0]:
                     batch_id=batch_id,
                 )
                 save_df(logs, LOGS_CSV)
-                st.success("Entry added.")
+                clear_log_form()
+                st.session_state.log_message = "Entry added."
+                st.rerun()
 
 # --------- Tab 2: Day View ---------
 with tabs[1]:
@@ -1289,7 +1335,8 @@ with tabs[3]:
                         prot_per,
                     ]
                     save_df(foods, FOODS_CSV)
-                    st.success("Food saved.")
+                    clear_add_food_form()
+                    st.session_state.master_data_message = "Food saved."
                     st.rerun()
             else:
                 st.error("Name and unit required.")
@@ -1572,7 +1619,8 @@ with tabs[3]:
                 save_df(dishes, DISHES_CSV)
                 logs = recalc_logs_for_dishes(logs, dishes, dings, foods, [dname])
                 save_df(logs, LOGS_CSV)
-                st.success("Dish saved and logs recalculated.")
+                clear_add_dish_form()
+                st.session_state.master_data_message = "Dish saved and logs recalculated."
                 st.rerun()
 
     section_heading(
@@ -1700,7 +1748,8 @@ with tabs[3]:
                     # Recalculate logs for this dish
                     logs = recalc_logs_for_dishes(logs, dishes, dings, foods, [dsel])
                     save_df(logs, LOGS_CSV)
-                    st.success("Ingredient added and logs recalculated.")
+                    clear_add_ingredient_form()
+                    st.session_state.master_data_message = "Ingredient added and logs recalculated."
                     st.rerun()
 
     section_heading(
@@ -2014,7 +2063,8 @@ with tabs[3]:
                         save_df(batch_ings, BATCH_ING_CSV)
 
                     save_df(batches, BATCHES_CSV)
-                    st.success("Batch saved.")
+                    clear_create_batch_form()
+                    st.session_state.master_data_message = "Batch saved."
                     st.rerun()
 
     with st.expander("View batches table", expanded=False):
@@ -2191,7 +2241,8 @@ with tabs[3]:
             else:
                 goals = upsert_goal(goals, day, cal_goal, prot_goal)
                 save_df(goals, GOALS_CSV)
-                st.success("Goal saved.")
+                clear_single_goal_form()
+                st.session_state.master_data_message = "Goal saved."
                 st.rerun()
 
     with st.expander("Bulk set goals for a date range"):
@@ -2241,7 +2292,8 @@ with tabs[3]:
                     goals = upsert_goal(goals, cur, bcal, bprot)
                     cur += timedelta(days=1)
                 save_df(goals, GOALS_CSV)
-                st.success("Goals applied to range.")
+                clear_bulk_goal_form()
+                st.session_state.master_data_message = "Goals applied to range."
                 st.rerun()
 
     with st.expander("View all goals", expanded=False):

@@ -53,6 +53,7 @@ GOALS_CSV = DATA_DIR / "goals.csv"
 LOGS_CSV = DATA_DIR / "logs.csv"
 BATCHES_CSV = DATA_DIR / "batches.csv"
 BATCH_ING_CSV = DATA_DIR / "batch_ingredients.csv"
+BACKUP_ZIP = Path(__file__).parent / "backup_data.zip"
 
 FOOD_COLUMNS = [
     "food_name",
@@ -223,6 +224,13 @@ def find_backup_member(extracted_dir: Path, filename: str) -> Path | None:
     return None
 
 
+def format_backup_timestamp(path: Path) -> str:
+    if not path.exists():
+        return "Backup ZIP not found yet."
+    modified_at = datetime.fromtimestamp(path.stat().st_mtime)
+    return "Backup ZIP last updated: " + modified_at.strftime("%d/%m/%Y %H:%M")
+
+
 def import_backup_zip_bytes(zip_bytes: bytes):
     try:
         with zipfile.ZipFile(io.BytesIO(zip_bytes)) as zf:
@@ -268,6 +276,7 @@ def import_backup_zip_bytes(zip_bytes: bytes):
 
 # --- 2. BACKUP UTILITY ---
 st.sidebar.header("System Admin")
+st.sidebar.caption(format_backup_timestamp(BACKUP_ZIP))
 st.sidebar.download_button(
     label="Download CSV Backup",
     data=build_backup_zip_bytes(),

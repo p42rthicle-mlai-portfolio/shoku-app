@@ -559,13 +559,11 @@ def clear_session_keys(keys):
 def render_status_pie(calories_ok: bool, protein_ok: bool):
     green = "#2e7d32"
     red = "#c62828"
-    ok_count = int(calories_ok) + int(protein_ok)
-    if ok_count == 2:
-        gradient = f"{green} 0 100%"
-    elif ok_count == 1:
-        gradient = f"{green} 0 50%, {red} 50% 100%"
-    else:
-        gradient = f"{red} 0 100%"
+    calorie_color = green if calories_ok else red
+    protein_color = green if protein_ok else red
+    calorie_label = "Under budget" if calories_ok else "Over budget"
+    protein_label = "Goal met" if protein_ok else "Not met"
+    gradient = f"{calorie_color} 0 50%, {protein_color} 50% 100%"
 
     st.markdown(
         f"""
@@ -578,8 +576,8 @@ def render_status_pie(calories_ok: bool, protein_ok: bool):
                 border:1px solid rgba(0,0,0,0.12);
             "></div>
             <div style="font-size:0.85rem;line-height:1.35;">
-                <div><span style="color:{green};font-weight:700;">Green</span>: goal met</div>
-                <div><span style="color:{red};font-weight:700;">Red</span>: needs attention</div>
+                <div><span style="font-weight:700;">Calories</span>: <span style="color:{calorie_color};font-weight:700;">{calorie_label}</span></div>
+                <div><span style="font-weight:700;">Protein</span>: <span style="color:{protein_color};font-weight:700;">{protein_label}</span></div>
             </div>
         </div>
         """,
@@ -1243,6 +1241,36 @@ with tabs[1]:
                     st.rerun()
 
     day_logs = logs[logs["date"] == view_date.isoformat()].copy()
+    tot_c, tot_p = daily_totals(logs, view_date)
+    st.markdown("### Daily totals")
+    m1, m2, m3 = st.columns(3)
+    m1.metric("Calories", f"{tot_c:.0f}")
+    m2.metric("Protein (g)", f"{tot_p:.1f}")
+    if gcal is not None and gprot is not None:
+        ok_c = tot_c <= gcal
+        ok_p = tot_p >= gprot
+        status_color = "#2e7d32" if ok_c and ok_p else "#c62828"
+        status_text = (
+            f"{'Under calories' if ok_c else 'Over calories'} | "
+            f"{'Protein met' if ok_p else 'Protein not met'}"
+        )
+        m3.markdown(
+            f"""
+            <div style="font-size:0.78rem;text-transform:uppercase;letter-spacing:0.04em;color:#666;">
+                Status
+            </div>
+            <div style="font-size:0.95rem;font-weight:700;color:{status_color};line-height:1.35;">
+                {status_text}
+            </div>
+            """,
+            unsafe_allow_html=True,
+        )
+        m3.caption("Daily goal status")
+        with m3:
+            render_status_pie(ok_c, ok_p)
+    else:
+        m3.caption("Set daily goals to see calorie and protein status.")
+
     if day_logs.empty:
         st.info("No entries for this date.")
     else:
@@ -1295,34 +1323,6 @@ with tabs[1]:
                 st.rerun()
             else:
                 st.error("Confirmation did not match. No entry was deleted.")
-
-        tot_c, tot_p = daily_totals(logs, view_date)
-        st.markdown("### Daily totals")
-        m1, m2, m3 = st.columns(3)
-        m1.metric("Calories", f"{tot_c:.0f}")
-        m2.metric("Protein (g)", f"{tot_p:.1f}")
-        if gcal is not None and gprot is not None:
-            ok_c = tot_c <= gcal
-            ok_p = tot_p >= gprot
-            status_color = "#2e7d32" if ok_c and ok_p else "#c62828"
-            status_text = (
-                f"{'Under calories' if ok_c else 'Over calories'} | "
-                f"{'Protein met' if ok_p else 'Protein not met'}"
-            )
-            m3.markdown(
-                f"""
-                <div style="font-size:0.78rem;text-transform:uppercase;letter-spacing:0.04em;color:#666;">
-                    Status
-                </div>
-                <div style="font-size:0.95rem;font-weight:700;color:{status_color};line-height:1.35;">
-                    {status_text}
-                </div>
-                """,
-                unsafe_allow_html=True,
-            )
-            m3.caption("Daily goal status")
-            with m3:
-                render_status_pie(ok_c, ok_p)
 
 # --------- Tab 3: Dashboard ---------
 with tabs[2]:

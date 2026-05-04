@@ -896,7 +896,9 @@ components.html(
           return true;
         }
         if (typeof target.closest === "function") {
-          return !!target.closest("[contenteditable='true'], input, textarea, [role='textbox']");
+          return !!target.closest(
+            "[contenteditable='true'], input, textarea, [role='textbox'], [role='combobox']"
+          );
         }
         return false;
       }
@@ -913,16 +915,6 @@ components.html(
         return isEditableTarget(event.target) || hasTextSelection();
       }
 
-      function shouldProtectTyping(event) {
-        if (!isEditableTarget(event.target)) {
-          return false;
-        }
-        if (event.metaKey || event.ctrlKey || event.altKey) {
-          return false;
-        }
-        return true;
-      }
-
       function stopForStreamlit(event) {
         event.stopPropagation();
         if (typeof event.stopImmediatePropagation === "function") {
@@ -931,7 +923,7 @@ components.html(
       }
 
       function handler(event) {
-        if (shouldProtectShortcut(event) || shouldProtectTyping(event)) {
+        if (shouldProtectShortcut(event)) {
           stopForStreamlit(event);
         }
       }

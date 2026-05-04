@@ -957,6 +957,29 @@ def recalc_logs_for_dishes(
     return logs
 
 
+def recalc_logs_for_batch(logs: pd.DataFrame, batch_row: pd.Series):
+    if batch_row is None:
+        return logs
+    metrics = get_batch_metrics(batch_row)
+    mask = (logs["type"] == "batch") & (logs["batch_id"] == batch_row["batch_id"])
+    if not mask.any():
+        return logs
+
+    serving_mask = mask & (logs["unit"] == "serving")
+    serving_qty = pd.to_numeric(logs.loc[serving_mask, "qty"], errors="coerce").fillna(0.0)
+    logs.loc[serving_mask, "calories"] = serving_qty * metrics["per_serving_calories"]
+    logs.loc[serving_mask, "protein"] = serving_qty * metrics["per_serving_protein"]
+
+    non_serving_mask = mask & (logs["unit"] != "serving")
+    if metrics["has_weight_basis"]:
+        weight_qty = pd.to_numeric(logs.loc[non_serving_mask, "qty"], errors="coerce").fillna(0.0)
+        logs.loc[non_serving_mask, "unit"] = metrics["final_unit"]
+        logs.loc[non_serving_mask, "calories"] = weight_qty * metrics["per_weight_calories"]
+        logs.loc[non_serving_mask, "protein"] = weight_qty * metrics["per_weight_protein"]
+
+    return logs
+
+
 # ---------- UI ----------
 st.set_page_config(page_title="Shoku", page_icon="🍱", layout="wide")
 
@@ -2378,6 +2401,266 @@ with tabs[3]:
                 st.info("No batch ingredient snapshot stored for this batch.")
             else:
                 st.dataframe(batch_ing_view, hide_index=True, use_container_width=True)
+
+    section_heading(
+        "Edit a batch",
+        "Update a saved batch snapshot, including servings, final weight, notes, and the saved ingredient snapshot. Batch log entries will be recalculated from the edited batch.",
+    )
+    if not batches.empty:
+        bedit = st.selectbox(
+            "Select batch to edit",
+            batches.apply(batch_key, axis=1).tolist(),
+            key="edit_batch_sel",
+        )
+        brow = batches[batches.apply(batch_key, axis=1) == bedit].iloc[0]
+        batch_id = brow["batch_id"]
+        batch_dish_name = brow["dish_name"]
+        template_match = dishes[dishes["dish_name"] == batch_dish_name]
+        template_row = template_match.iloc[0] if not template_match.empty else None
+        existing_batch_ings = batch_ings[batch_ings["batch_id"] == batch_id].copy()
+        existing_batch_ings = existing_batch_ings.rename(
+            columns={"ingredient_qty": "ingredient_qty_per_serving"}
+        )
+        batch_edit_state_key = f"edit_batch_{batch_id}"
+        batch_edit_loaded_key = "edit_batch_loaded_id"
+        force_reload_batch = st.session_state.get(batch_edit_loaded_key) != batch_id
+        row_state_key, row_seq_key = initialize_batch_ingredient_rows(
+            batch_edit_state_key,
+            existing_batch_ings,
+            force_reload=force_reload_batch,
+        )
+        st.session_state[batch_edit_loaded_key] = batch_id
+
+        edit_servings = st.number_input(
+            "Batch servings",
+            min_value=1.0,
+            step=1.0,
+            value=float(brow["servings"]) if pd.notna(brow["servings"]) else 1.0,
+            key=f"edit_batch_servings_{batch_id}",
+        )
+        c1, c2 = st.columns(2)
+        with c1:
+            edit_final_qty = st.number_input(
+                "Final batch quantity",
+                min_value=0.0,
+                step=1.0,
+                value=as_float(brow["final_qty"], 0.0),
+                key=f"edit_batch_final_qty_{batch_id}",
+            )
+        with c2:
+            edit_final_unit = st.text_input(
+                "Final batch unit",
+                value=as_text(brow["final_unit"]),
+                key=f"edit_batch_final_unit_{batch_id}",
+            )
+        edit_notes = st.text_input(
+            "Notes",
+            value=as_text(brow["notes"]),
+            key=f"edit_batch_notes_{batch_id}",
+            placeholder="Optional note like thinner than usual, extra water, etc.",
+        )
+
+        edit_batch_ingredient_rows = []
+        if template_row is not None and is_override_dish(template_row) and existing_batch_ings.empty:
+            st.info(
+                "This batch is tied to an override dish template, so editing servings/final weight updates totals from the override values."
+            )
+        else:
+            st.write("Batch ingredient snapshot")
+            st.caption(
+                "Change quantities, swap foods or units, remove ingredients, and add new rows for this saved batch snapshot."
+            )
+            remove_row_id = None
+            food_choices = sorted(foods["food_name"].unique().tolist())
+            current_rows = list(st.session_state.get(row_state_key, []))
+            if not current_rows:
+                st.info("No ingredient rows yet. Add one below if this batch needs ingredients.")
+
+            for row in current_rows:
+                row_id = row["row_id"]
+                food_key_name = f"{row_state_key}_{row_id}_food"
+                unit_key_name = f"{row_state_key}_{row_id}_unit"
+                qty_key_name = f"{row_state_key}_{row_id}_qty"
+
+                if food_key_name not in st.session_state:
+                    st.session_state[food_key_name] = row["ingredient_food_name"]
+                if qty_key_name not in st.session_state:
+                    st.session_state[qty_key_name] = float(row["ingredient_qty"])
+
+                selected_food = st.session_state.get(food_key_name, "")
+                if selected_food not in food_choices and food_choices:
+                    selected_food = food_choices[0]
+                    st.session_state[food_key_name] = selected_food
+
+                unit_choices = sorted(
+                    foods[foods["food_name"] == selected_food]["unit"]
+                    .dropna()
+                    .astype(str)
+                    .tolist()
+                )
+                if not unit_choices:
+                    unit_choices = [""]
+                if (
+                    unit_key_name not in st.session_state
+                    or st.session_state[unit_key_name] not in unit_choices
+                ):
+                    preferred_unit = row["ingredient_unit"]
+                    st.session_state[unit_key_name] = (
+                        preferred_unit if preferred_unit in unit_choices else unit_choices[0]
+                    )
+
+                c1, c2, c3, c4, c5 = st.columns([3, 2, 2, 2, 1])
+                with c1:
+                    food_choice = st.selectbox(
+                        "Ingredient food",
+                        food_choices if food_choices else [""],
+                        index=(
+                            (food_choices if food_choices else [""]).index(selected_food)
+                            if selected_food in (food_choices if food_choices else [""])
+                            else 0
+                        ),
+                        key=food_key_name,
+                        label_visibility="collapsed",
+                    )
+                with c2:
+                    unit_choice = st.selectbox(
+                        "Ingredient unit",
+                        unit_choices,
+                        index=unit_choices.index(st.session_state[unit_key_name]),
+                        key=unit_key_name,
+                        label_visibility="collapsed",
+                    )
+                with c3:
+                    qty_value = st.number_input(
+                        "Qty",
+                        min_value=0.0,
+                        step=1.0,
+                        key=qty_key_name,
+                        label_visibility="collapsed",
+                    )
+                with c4:
+                    frow = get_food_row(foods, food_choice, unit_choice)
+                    if frow is None:
+                        st.caption("Food missing")
+                    else:
+                        est_c = qty_value * as_float(frow["cal_per_unit"], 0.0)
+                        est_p = qty_value * as_float(frow["protein_per_unit"], 0.0)
+                        st.caption(f"{est_c:.0f} kcal | {est_p:.1f}g")
+                with c5:
+                    if st.button("Remove", key=f"{row_state_key}_{row_id}_remove"):
+                        remove_row_id = row_id
+
+                row["ingredient_food_name"] = food_choice
+                row["ingredient_unit"] = unit_choice
+                row["ingredient_qty"] = qty_value
+                if qty_value > 0 and food_choice and unit_choice:
+                    edit_batch_ingredient_rows.append(
+                        {
+                            "ingredient_food_name": food_choice,
+                            "ingredient_unit": unit_choice,
+                            "ingredient_qty": qty_value,
+                        }
+                    )
+
+            st.session_state[row_state_key] = current_rows
+            add_col, _ = st.columns([1, 4])
+            with add_col:
+                if st.button("Add ingredient row", key=f"{row_state_key}_add"):
+                    add_batch_ingredient_row(batch_edit_state_key, foods)
+                    st.rerun()
+            if remove_row_id is not None:
+                remove_batch_ingredient_row(batch_edit_state_key, remove_row_id)
+                st.rerun()
+
+        edit_preview_metrics = None
+        if template_row is not None and is_override_dish(template_row) and not edit_batch_ingredient_rows:
+            total_c = as_float(template_row["cal_override"], 0.0) * edit_servings
+            total_p = as_float(template_row["protein_override"], 0.0) * edit_servings
+            edit_preview_metrics = build_portion_metrics(
+                edit_servings,
+                total_c,
+                total_p,
+                edit_final_qty if edit_final_qty > 0 else 0.0,
+                edit_final_unit.strip(),
+            )
+        elif edit_batch_ingredient_rows:
+            edit_batch_ingredients_df = pd.DataFrame(edit_batch_ingredient_rows)
+            total_c, total_p = compute_ingredient_totals(
+                edit_batch_ingredients_df, foods, "ingredient_qty"
+            )
+            auto_qty, auto_unit = get_auto_yield_from_ingredients(
+                edit_batch_ingredients_df, "ingredient_qty"
+            )
+            edit_preview_metrics = build_portion_metrics(
+                edit_servings,
+                total_c,
+                total_p,
+                edit_final_qty if edit_final_qty > 0 else 0.0,
+                edit_final_unit.strip(),
+                auto_qty,
+                auto_unit,
+            )
+
+        if edit_preview_metrics is not None:
+            p1, p2, p3 = st.columns(3)
+            p1.metric("Batch calories", f"{edit_preview_metrics['total_calories']:.0f}")
+            p2.metric("Batch protein (g)", f"{edit_preview_metrics['total_protein']:.1f}")
+            p3.metric("Final qty source", edit_preview_metrics["yield_source"] or "none")
+            st.caption(
+                f"Per serving: {edit_preview_metrics['per_serving_calories']:.1f} kcal, "
+                f"{edit_preview_metrics['per_serving_protein']:.2f}g protein."
+            )
+            if edit_preview_metrics["has_weight_basis"]:
+                st.caption(
+                    f"Per {edit_preview_metrics['final_unit']}: "
+                    f"{edit_preview_metrics['per_weight_calories']:.3f} kcal, "
+                    f"{edit_preview_metrics['per_weight_protein']:.4f}g protein."
+                )
+
+        if st.button("Save batch changes", key="save_batch_edit"):
+            edit_final_unit = edit_final_unit.strip()
+            if edit_final_qty > 0 and not edit_final_unit:
+                st.error("Final batch unit is required when final batch quantity is set.")
+            elif template_row is None and not edit_batch_ingredient_rows:
+                st.error("This batch needs at least one saved ingredient row because its template is missing.")
+            elif template_row is not None and not is_override_dish(template_row) and not edit_batch_ingredient_rows:
+                st.error("This batch needs at least one ingredient quantity greater than 0.")
+            else:
+                if edit_preview_metrics is None:
+                    edit_preview_metrics = build_portion_metrics(
+                        edit_servings, 0.0, 0.0, 0.0, ""
+                    )
+
+                batch_index = brow.name
+                batches.loc[batch_index, "servings"] = edit_servings
+                batches.loc[batch_index, "final_qty"] = (
+                    edit_preview_metrics["final_qty"] if edit_preview_metrics["has_weight_basis"] else None
+                )
+                batches.loc[batch_index, "final_unit"] = (
+                    edit_preview_metrics["final_unit"] if edit_preview_metrics["has_weight_basis"] else None
+                )
+                batches.loc[batch_index, "yield_source"] = edit_preview_metrics["yield_source"]
+                batches.loc[batch_index, "total_calories"] = edit_preview_metrics["total_calories"]
+                batches.loc[batch_index, "total_protein"] = edit_preview_metrics["total_protein"]
+                batches.loc[batch_index, "notes"] = edit_notes.strip()
+
+                batch_ings = batch_ings[batch_ings["batch_id"] != batch_id]
+                if edit_batch_ingredient_rows:
+                    edit_batch_ingredients_to_save = pd.DataFrame(edit_batch_ingredient_rows)
+                    edit_batch_ingredients_to_save.insert(0, "batch_id", batch_id)
+                    batch_ings = pd.concat(
+                        [batch_ings, edit_batch_ingredients_to_save[BATCH_INGREDIENT_COLUMNS]],
+                        ignore_index=True,
+                    )
+
+                updated_batch_row = get_batch_row(batches, batch_id)
+                logs = recalc_logs_for_batch(logs, updated_batch_row)
+
+                save_df(batches, BATCHES_CSV)
+                save_df(batch_ings, BATCH_ING_CSV)
+                save_df(logs, LOGS_CSV)
+                st.success("Batch updated.")
+                st.rerun()
 
     section_heading(
         "Delete a batch",

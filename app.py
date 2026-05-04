@@ -2,13 +2,17 @@
 # MVP: meals, units, foods+dishes, per-day goal locking, calendar view, mandatory list, dashboard
 
 import streamlit as st
+import streamlit.components.v1 as components
 import pandas as pd
+import io
 from pathlib import Path
-from datetime import date, timedelta
+from datetime import date, datetime, timedelta
 from typing import Tuple
 
 import shutil
 import os
+import tempfile
+import zipfile
 
 # --- 1. SECURITY LAYER ---
 def check_password():
@@ -35,22 +39,6 @@ if not check_password():
     st.stop()
 
 
-# --- 2. BACKUP UTILITY ---
-st.sidebar.header("System Admin")
-if st.sidebar.button("Generate CSV Backup"):
-    # Creates a ZIP file of your entire 'data' folder
-    if os.path.exists("data"):
-        shutil.make_archive("backup_data", 'zip', "data")
-        with open("backup_data.zip", "rb") as f:
-            st.sidebar.download_button(
-                label="Download Backup ZIP",
-                data=f,
-                file_name="shoku_data_backup.zip",
-                mime="application/zip"
-            )
-    else:
-        st.sidebar.error("Data directory not found on server.")
-
 # --- YOUR EXISTING APP.PY CODE STARTS HERE ---
 # (Keep all your original logic below this line)
 
@@ -63,6 +51,9 @@ DISHES_CSV = DATA_DIR / "dishes.csv"
 DISH_ING_CSV = DATA_DIR / "dish_ingredients.csv"
 GOALS_CSV = DATA_DIR / "goals.csv"
 LOGS_CSV = DATA_DIR / "logs.csv"
+BATCHES_CSV = DATA_DIR / "batches.csv"
+BATCH_ING_CSV = DATA_DIR / "batch_ingredients.csv"
+BACKUP_ZIP = Path(__file__).parent / "backup_data.zip"
 
 FOOD_COLUMNS = [
     "food_name",
@@ -88,7 +79,37 @@ DISH_INGREDIENT_COLUMNS = [
     "ingredient_qty_per_serving",
 ]
 GOAL_COLUMNS = ["date", "calorie_goal", "protein_goal"]
-LOG_COLUMNS = ["date", "meal", "type", "name", "unit", "qty", "calories", "protein"]
+LOG_COLUMNS = ["date", "meal", "type", "name", "batch_id", "unit", "qty", "calories", "protein"]
+BATCH_COLUMNS = [
+    "batch_id",
+    "dish_name",
+    "batch_date",
+    "servings",
+    "final_qty",
+    "final_unit",
+    "yield_source",
+    "total_calories",
+    "total_protein",
+    "notes",
+]
+BATCH_INGREDIENT_COLUMNS = [
+    "batch_id",
+    "ingredient_food_name",
+    "ingredient_unit",
+    "ingredient_qty",
+]
+DATE_INPUT_FORMAT = "DD/MM/YYYY"
+REQUIRED_BACKUP_FILES = {
+    "foods.csv": FOOD_COLUMNS,
+    "dishes.csv": DISH_COLUMNS,
+    "dish_ingredients.csv": DISH_INGREDIENT_COLUMNS,
+    "goals.csv": GOAL_COLUMNS,
+    "logs.csv": LOG_COLUMNS,
+}
+OPTIONAL_BACKUP_FILES = {
+    "batches.csv": BATCH_COLUMNS,
+    "batch_ingredients.csv": BATCH_INGREDIENT_COLUMNS,
+}
 
 # ---------- Utilities ----------
 
@@ -116,6 +137,8 @@ def load_all():
     dings = ensure_csv(DISH_ING_CSV, DISH_INGREDIENT_COLUMNS)
     goals = ensure_csv(GOALS_CSV, GOAL_COLUMNS)
     logs = ensure_csv(LOGS_CSV, LOG_COLUMNS)
+    batches = ensure_csv(BATCHES_CSV, BATCH_COLUMNS)
+    batch_ings = ensure_csv(BATCH_ING_CSV, BATCH_INGREDIENT_COLUMNS)
     # Coerce types
     for col in ["base_qty", "calories_base", "protein_base", "cal_per_unit", "protein_per_unit"]:
         if col in foods.columns:
@@ -132,7 +155,13 @@ def load_all():
     for col in ["qty", "calories", "protein"]:
         if col in logs.columns:
             logs[col] = pd.to_numeric(logs[col], errors="coerce")
-    return foods, dishes, dings, goals, logs
+    for col in ["servings", "final_qty", "total_calories", "total_protein"]:
+        if col in batches.columns:
+            batches[col] = pd.to_numeric(batches[col], errors="coerce")
+    for col in ["ingredient_qty"]:
+        if col in batch_ings.columns:
+            batch_ings[col] = pd.to_numeric(batch_ings[col], errors="coerce")
+    return foods, dishes, dings, goals, logs, batches, batch_ings
 
 
 def save_df(df: pd.DataFrame, path: Path):
@@ -153,6 +182,131 @@ def reset_all_data():
     reset_csv(DISH_ING_CSV, DISH_INGREDIENT_COLUMNS)
     reset_csv(GOALS_CSV, GOAL_COLUMNS)
     reset_csv(LOGS_CSV, LOG_COLUMNS)
+    reset_csv(BATCHES_CSV, BATCH_COLUMNS)
+    reset_csv(BATCH_ING_CSV, BATCH_INGREDIENT_COLUMNS)
+
+
+def normalize_import_df(df: pd.DataFrame, columns: list) -> pd.DataFrame:
+    for column in columns:
+        if column not in df.columns:
+            df[column] = None
+    return df[columns]
+
+
+def get_backup_sources():
+    return {
+        "foods.csv": FOODS_CSV,
+        "dishes.csv": DISHES_CSV,
+        "dish_ingredients.csv": DISH_ING_CSV,
+        "goals.csv": GOALS_CSV,
+        "logs.csv": LOGS_CSV,
+        "batches.csv": BATCHES_CSV,
+        "batch_ingredients.csv": BATCH_ING_CSV,
+    }
+
+
+def build_backup_zip_bytes() -> bytes:
+    buffer = io.BytesIO()
+    with zipfile.ZipFile(buffer, "w", zipfile.ZIP_DEFLATED) as zf:
+        for filename, path in get_backup_sources().items():
+            if path.exists():
+                zf.writestr(filename, path.read_bytes())
+    return buffer.getvalue()
+
+
+def find_backup_member(extracted_dir: Path, filename: str) -> Path | None:
+    direct = extracted_dir / filename
+    nested = extracted_dir / "data" / filename
+    if direct.exists():
+        return direct
+    if nested.exists():
+        return nested
+    return None
+
+
+def format_backup_timestamp(path: Path) -> str:
+    if not path.exists():
+        return "Backup ZIP not found yet."
+    modified_at = datetime.fromtimestamp(path.stat().st_mtime)
+    return "Backup ZIP last updated: " + modified_at.strftime("%d/%m/%Y %H:%M")
+
+
+def import_backup_zip_bytes(zip_bytes: bytes):
+    try:
+        with zipfile.ZipFile(io.BytesIO(zip_bytes)) as zf:
+            members = [name for name in zf.namelist() if not name.endswith("/")]
+            required_names = set(REQUIRED_BACKUP_FILES.keys())
+            present_names = {Path(name).name for name in members}
+            missing = sorted(required_names - present_names)
+            if missing:
+                raise ValueError(
+                    "Backup is missing required files: " + ", ".join(missing)
+                )
+
+            with tempfile.TemporaryDirectory(prefix="shoku_import_") as tmp_dir:
+                extracted_dir = Path(tmp_dir)
+                zf.extractall(extracted_dir)
+
+                for filename, columns in REQUIRED_BACKUP_FILES.items():
+                    source = find_backup_member(extracted_dir, filename)
+                    if source is None:
+                        raise ValueError(f"Could not find {filename} in the backup ZIP.")
+                    imported_df = pd.read_csv(source)
+                    normalize_import_df(imported_df, columns).to_csv(
+                        get_backup_sources()[filename],
+                        index=False,
+                    )
+
+                for filename, columns in OPTIONAL_BACKUP_FILES.items():
+                    source = find_backup_member(extracted_dir, filename)
+                    if source is None:
+                        pd.DataFrame(columns=columns).to_csv(
+                            get_backup_sources()[filename],
+                            index=False,
+                        )
+                    else:
+                        imported_df = pd.read_csv(source)
+                        normalize_import_df(imported_df, columns).to_csv(
+                            get_backup_sources()[filename],
+                            index=False,
+                        )
+    except zipfile.BadZipFile as exc:
+        raise ValueError("Uploaded file is not a valid ZIP archive.") from exc
+
+
+# --- 2. BACKUP UTILITY ---
+st.sidebar.header("System Admin")
+st.sidebar.caption(format_backup_timestamp(BACKUP_ZIP))
+st.sidebar.download_button(
+    label="Download CSV Backup",
+    data=build_backup_zip_bytes(),
+    file_name="shoku_data_backup.zip",
+    mime="application/zip",
+)
+backup_upload = st.sidebar.file_uploader(
+    "Import backup ZIP",
+    type=["zip"],
+    key="backup_import_zip",
+    help="Imports a backup ZIP and rewrites all app CSV data after confirmation.",
+)
+confirm_backup_import = st.sidebar.text_input(
+    "Type IMPORT BACKUP to confirm",
+    key="confirm_backup_import",
+)
+if st.sidebar.button("Import backup and replace data", key="import_backup_button"):
+    if backup_upload is None:
+        st.sidebar.error("Upload a backup ZIP first.")
+    elif confirm_backup_import.strip() != "IMPORT BACKUP":
+        st.sidebar.error("Confirmation did not match. Import was cancelled.")
+    else:
+        try:
+            import_backup_zip_bytes(backup_upload.getvalue())
+            st.session_state.pop("backup_import_zip", None)
+            st.session_state.pop("confirm_backup_import", None)
+            st.sidebar.success("Backup imported. Local CSV data was replaced.")
+            st.rerun()
+        except ValueError as exc:
+            st.sidebar.error(str(exc))
 
 
 def food_key(row) -> str:
@@ -174,11 +328,127 @@ def as_text(value) -> str:
     return str(value).strip()
 
 
+def parse_date_value(value):
+    if isinstance(value, date):
+        return value
+    if pd.isna(value):
+        return None
+    parsed = pd.to_datetime(value, errors="coerce")
+    if pd.isna(parsed):
+        return None
+    return parsed.date()
+
+
+def format_day(day_value) -> str:
+    parsed = parse_date_value(day_value)
+    if parsed is None:
+        return ""
+    return parsed.strftime("%d/%m/%Y")
+
+
+def format_date_series(values: pd.Series) -> pd.Series:
+    return values.apply(format_day)
+
+
+def short_batch_id(batch_id: str) -> str:
+    batch_text = as_text(batch_id)
+    if not batch_text:
+        return ""
+    return batch_text[-6:]
+
+
+def batch_key(row) -> str:
+    batch_date = format_day(row.get("batch_date"))
+    servings = as_float(row.get("servings"), 1.0)
+    final_qty = as_float(row.get("final_qty"), 0.0)
+    final_unit = as_text(row.get("final_unit"))
+    final_text = ""
+    if final_qty > 0 and final_unit:
+        final_text = f" | {final_qty:g} {final_unit}"
+    return (
+        f"{row['dish_name']} | {batch_date or 'No date'} | "
+        f"{servings:g} servings{final_text} | {short_batch_id(row.get('batch_id'))}"
+    )
+
+
 def get_food_row(foods: pd.DataFrame, food_name: str, unit: str):
     m = (foods["food_name"] == food_name) & (foods["unit"] == unit)
     if not m.any():
         return None
     return foods[m].iloc[0]
+
+
+def compute_ingredient_totals(
+    ingredients: pd.DataFrame, foods: pd.DataFrame, qty_column: str
+) -> Tuple[float, float]:
+    total_c = 0.0
+    total_p = 0.0
+    for _, ing in ingredients.iterrows():
+        frow = get_food_row(foods, ing["ingredient_food_name"], ing["ingredient_unit"])
+        if frow is None:
+            continue
+        qty = as_float(ing[qty_column], 0.0)
+        total_c += qty * as_float(frow["cal_per_unit"], 0.0)
+        total_p += qty * as_float(frow["protein_per_unit"], 0.0)
+    return total_c, total_p
+
+
+def get_auto_yield_from_ingredients(
+    ingredients: pd.DataFrame, qty_column: str
+) -> Tuple[float, str]:
+    use = ingredients.copy()
+    if use.empty:
+        return 0.0, ""
+
+    use["ingredient_unit"] = use["ingredient_unit"].fillna("").astype(str).str.strip()
+    use[qty_column] = pd.to_numeric(use[qty_column], errors="coerce")
+    use = use[(use["ingredient_unit"] != "") & use[qty_column].notna()]
+    if use.empty:
+        return 0.0, ""
+
+    units = use["ingredient_unit"].unique().tolist()
+    if len(units) != 1:
+        return 0.0, ""
+
+    return float(use[qty_column].sum()), units[0]
+
+
+def build_portion_metrics(
+    servings: float,
+    total_calories: float,
+    total_protein: float,
+    manual_qty: float,
+    manual_unit: str,
+    auto_qty: float = 0.0,
+    auto_unit: str = "",
+):
+    final_qty = 0.0
+    final_unit = ""
+    yield_source = "none"
+    if manual_qty > 0 and manual_unit:
+        final_qty = manual_qty
+        final_unit = manual_unit
+        yield_source = "manual"
+    elif auto_qty > 0 and auto_unit:
+        final_qty = auto_qty
+        final_unit = auto_unit
+        yield_source = "auto"
+
+    has_weight_basis = final_qty > 0 and bool(final_unit)
+    safe_servings = servings if servings > 0 else 1.0
+    return {
+        "servings": safe_servings,
+        "total_calories": total_calories,
+        "total_protein": total_protein,
+        "per_serving_calories": total_calories / safe_servings,
+        "per_serving_protein": total_protein / safe_servings,
+        "final_qty": final_qty,
+        "final_unit": final_unit,
+        "yield_source": yield_source,
+        "has_weight_basis": has_weight_basis,
+        "per_weight_calories": total_calories / final_qty if has_weight_basis else 0.0,
+        "per_weight_protein": total_protein / final_qty if has_weight_basis else 0.0,
+    }
 
 
 def normalize_food_row(row):
@@ -205,21 +475,64 @@ def normalize_food_row(row):
 
 
 def clear_add_food_form():
-    st.session_state.add_food_name = ""
-    st.session_state.add_food_unit = ""
-    st.session_state.add_base_qty = 100.0
-    st.session_state.add_cal_base = 0.0
-    st.session_state.add_prot_base = 0.0
+    clear_session_keys(
+        [
+            "add_food_name",
+            "add_food_unit",
+            "add_base_qty",
+            "add_cal_base",
+            "add_prot_base",
+        ]
+    )
 
 
 def clear_add_dish_form():
-    st.session_state.add_dish_name = ""
-    st.session_state.add_dish_override = False
-    st.session_state.add_dish_cal = 0.0
-    st.session_state.add_dish_prot = 0.0
-    st.session_state.add_dish_servings = 1.0
-    st.session_state.add_dish_yield_qty = 0.0
-    st.session_state.add_dish_yield_unit = ""
+    clear_session_keys(
+        [
+            "add_dish_name",
+            "add_dish_override",
+            "add_dish_cal",
+            "add_dish_prot",
+            "add_dish_servings",
+            "add_dish_yield_qty",
+            "add_dish_yield_unit",
+        ]
+    )
+
+
+def clear_create_batch_form():
+    for key in list(st.session_state.keys()):
+        if key.startswith("create_batch_"):
+            st.session_state.pop(key, None)
+
+
+def clear_log_form():
+    clear_session_keys(
+        [
+            "log_date",
+            "log_meal",
+            "log_type",
+            "log_qty",
+            "log_food_name",
+            "log_food_unit",
+            "log_dish_name",
+            "log_dish_basis",
+            "log_batch_sel",
+            "log_batch_basis",
+        ]
+    )
+
+
+def clear_add_ingredient_form():
+    clear_session_keys(["add_ing_food", "add_ing_unit", "add_ing_qty"])
+
+
+def clear_single_goal_form():
+    clear_session_keys(["goal_date", "cal_goal2", "prot_goal2"])
+
+
+def clear_bulk_goal_form():
+    clear_session_keys(["bulk_start", "bulk_end", "bulk_cal", "bulk_prot"])
 
 
 def set_view_date_today():
@@ -227,8 +540,11 @@ def set_view_date_today():
 
 
 def log_entry_label(idx, row) -> str:
+    item_name = row["name"]
+    if row.get("type") == "batch" and as_text(row.get("batch_id")):
+        item_name = f"{item_name} [{short_batch_id(row.get('batch_id'))}]"
     return (
-        f"{idx}: {row['meal']} - {row['type']} - {row['name']} "
+        f"{idx}: {row['meal']} - {row['type']} - {item_name} "
         f"({as_float(row['qty'], 0.0):g} {row['unit']}, "
         f"{as_float(row['calories'], 0.0):.0f} kcal, "
         f"{as_float(row['protein'], 0.0):.1f}g protein)"
@@ -240,30 +556,50 @@ def clear_session_keys(keys):
         st.session_state.pop(key, None)
 
 
-def render_status_pie(calories_ok: bool, protein_ok: bool):
+def render_goal_progress(
+    label: str, consumed: float, goal: float, good_when_under: bool
+):
     green = "#2e7d32"
     red = "#c62828"
-    ok_count = int(calories_ok) + int(protein_ok)
-    if ok_count == 2:
-        gradient = f"{green} 0 100%"
-    elif ok_count == 1:
-        gradient = f"{green} 0 50%, {red} 50% 100%"
+    track = "#ebedf0"
+    if goal <= 0:
+        fill_pct = 0.0
+        ok = False
     else:
-        gradient = f"{red} 0 100%"
+        fill_pct = min(consumed / goal, 1.0) * 100
+        ok = consumed <= goal if good_when_under else consumed >= goal
+    color = green if ok else red
+    status = (
+        "Under budget" if good_when_under and ok else
+        "Over budget" if good_when_under else
+        "Goal met" if ok else
+        "Not met"
+    )
 
     st.markdown(
         f"""
-        <div style="display:flex;align-items:center;gap:12px;margin-top:4px;">
-            <div aria-label="Daily status pie chart" style="
-                width:64px;
-                height:64px;
-                border-radius:50%;
-                background:conic-gradient({gradient});
-                border:1px solid rgba(0,0,0,0.12);
-            "></div>
-            <div style="font-size:0.85rem;line-height:1.35;">
-                <div><span style="color:{green};font-weight:700;">Green</span>: goal met</div>
-                <div><span style="color:{red};font-weight:700;">Red</span>: needs attention</div>
+        <div style="margin-top:6px;">
+            <div style="display:flex;justify-content:space-between;align-items:baseline;gap:12px;">
+                <div style="font-size:0.92rem;font-weight:700;color:#1f2937;">{label}</div>
+                <div style="font-size:0.85rem;font-weight:700;color:{color};">{status}</div>
+            </div>
+            <div style="
+                margin-top:6px;
+                width:100%;
+                height:12px;
+                border-radius:999px;
+                background:{track};
+                overflow:hidden;
+            ">
+                <div style="
+                    width:{fill_pct:.1f}%;
+                    height:100%;
+                    background:{color};
+                    border-radius:999px;
+                "></div>
+            </div>
+            <div style="margin-top:6px;font-size:0.82rem;color:#666;">
+                {consumed:.1f} consumed / {goal:.1f} goal
             </div>
         </div>
         """,
@@ -308,40 +644,14 @@ def compute_dish_totals(
         return float(row["cal_override"]) * servings, float(row["protein_override"]) * servings
 
     use = dings[dings["dish_name"] == dish_name]
-    total_c = 0.0
-    total_p = 0.0
-    for _, ing in use.iterrows():
-        frow = get_food_row(foods, ing["ingredient_food_name"], ing["ingredient_unit"])
-        if frow is None:
-            continue
-        qty = as_float(ing["ingredient_qty_per_serving"], 0.0)
-        total_c += qty * as_float(frow["cal_per_unit"], 0.0)
-        total_p += qty * as_float(frow["protein_per_unit"], 0.0)
-    return total_c, total_p
+    return compute_ingredient_totals(use, foods, "ingredient_qty_per_serving")
 
 
 def get_auto_dish_yield(
     dish_name: str, dings: pd.DataFrame
 ) -> Tuple[float, str]:
     use = dings[dings["dish_name"] == dish_name].copy()
-    if use.empty:
-        return 0.0, ""
-
-    use["ingredient_unit"] = use["ingredient_unit"].fillna("").astype(str).str.strip()
-    use["ingredient_qty_per_serving"] = pd.to_numeric(
-        use["ingredient_qty_per_serving"], errors="coerce"
-    )
-    use = use[
-        (use["ingredient_unit"] != "") & use["ingredient_qty_per_serving"].notna()
-    ]
-    if use.empty:
-        return 0.0, ""
-
-    units = use["ingredient_unit"].unique().tolist()
-    if len(units) != 1:
-        return 0.0, ""
-
-    return float(use["ingredient_qty_per_serving"].sum()), units[0]
+    return get_auto_yield_from_ingredients(use, "ingredient_qty_per_serving")
 
 
 def get_effective_dish_yield(
@@ -380,22 +690,17 @@ def get_dish_metrics(
     row = md.iloc[0]
     servings = get_dish_servings(row)
     total_c, total_p = compute_dish_totals(dish_name, dishes, dings, foods)
-    final_qty, final_unit, yield_source = get_effective_dish_yield(dish_name, row, dings)
-    has_weight_basis = final_qty > 0 and bool(final_unit)
-
-    return {
-        "servings": servings,
-        "total_calories": total_c,
-        "total_protein": total_p,
-        "per_serving_calories": total_c / servings if servings > 0 else 0.0,
-        "per_serving_protein": total_p / servings if servings > 0 else 0.0,
-        "final_qty": final_qty,
-        "final_unit": final_unit,
-        "yield_source": yield_source,
-        "has_weight_basis": has_weight_basis,
-        "per_weight_calories": total_c / final_qty if has_weight_basis else 0.0,
-        "per_weight_protein": total_p / final_qty if has_weight_basis else 0.0,
-    }
+    manual_qty, manual_unit = get_dish_yield(row)
+    auto_qty, auto_unit = get_auto_dish_yield(dish_name, dings)
+    return build_portion_metrics(
+        servings,
+        total_c,
+        total_p,
+        manual_qty,
+        manual_unit,
+        auto_qty,
+        auto_unit,
+    )
 
 
 def get_dish_log_options(
@@ -433,6 +738,53 @@ def compute_dish_base(
     return 0.0, 0.0
 
 
+def make_batch_id(batch_day: date) -> str:
+    return f"batch_{batch_day.strftime('%Y%m%d')}_{datetime.now().strftime('%H%M%S%f')}"
+
+
+def get_batch_row(batches: pd.DataFrame, batch_id: str):
+    match = batches[batches["batch_id"] == batch_id]
+    if match.empty:
+        return None
+    return match.iloc[0]
+
+
+def get_batch_metrics(batch_row):
+    if batch_row is None:
+        return build_portion_metrics(1.0, 0.0, 0.0, 0.0, "")
+    return build_portion_metrics(
+        as_float(batch_row.get("servings"), 1.0),
+        as_float(batch_row.get("total_calories"), 0.0),
+        as_float(batch_row.get("total_protein"), 0.0),
+        as_float(batch_row.get("final_qty"), 0.0),
+        as_text(batch_row.get("final_unit")),
+    )
+
+
+def get_batch_log_options(batch_row):
+    metrics = get_batch_metrics(batch_row)
+    options = [("serving", "Serving")]
+    if metrics["has_weight_basis"]:
+        source = as_text(batch_row.get("yield_source")) or "manual"
+        source_label = "manual final weight" if source == "manual" else "auto final weight"
+        options.append(
+            (
+                metrics["final_unit"],
+                f"Weight ({metrics['final_unit']}, {source_label})",
+            )
+        )
+    return options
+
+
+def compute_batch_base(batch_row, log_unit: str = "serving") -> Tuple[float, float]:
+    metrics = get_batch_metrics(batch_row)
+    if log_unit == "serving":
+        return metrics["per_serving_calories"], metrics["per_serving_protein"]
+    if metrics["has_weight_basis"] and log_unit == metrics["final_unit"]:
+        return metrics["per_weight_calories"], metrics["per_weight_protein"]
+    return 0.0, 0.0
+
+
 def get_goal_for_date(goals: pd.DataFrame, day: date):
     s = goals[goals["date"] == day.isoformat()]
     if s.empty:
@@ -463,8 +815,19 @@ def add_log_entry(
     qty: float,
     cal: float,
     prot: float,
+    batch_id: str = "",
 ) -> pd.DataFrame:
-    logs.loc[len(logs)] = [day.isoformat(), meal, typ, name, unit, qty, cal, prot]
+    logs.loc[len(logs)] = [
+        day.isoformat(),
+        meal,
+        typ,
+        name,
+        batch_id,
+        unit,
+        qty,
+        cal,
+        prot,
+    ]
     return logs
 
 
@@ -533,6 +896,76 @@ def recalc_logs_for_dishes(
 # ---------- UI ----------
 st.set_page_config(page_title="Shoku", page_icon="🍱", layout="wide")
 
+components.html(
+    """
+    <script>
+    (function () {
+      const parentWindow = window.parent;
+      const parentDocument = parentWindow.document;
+      if (parentWindow.__shokuKeyboardFixInstalled) {
+        return;
+      }
+      parentWindow.__shokuKeyboardFixInstalled = true;
+
+      function hasTextSelection() {
+        try {
+          const selection = parentWindow.getSelection();
+          return !!selection && String(selection).length > 0;
+        } catch (error) {
+          return false;
+        }
+      }
+
+      function isEditableTarget(target) {
+        if (!target) {
+          return false;
+        }
+        const tagName = (target.tagName || "").toLowerCase();
+        if (target.isContentEditable || tagName === "input" || tagName === "textarea") {
+          return true;
+        }
+        if (typeof target.closest === "function") {
+          return !!target.closest(
+            "[contenteditable='true'], input, textarea, [role='textbox'], [role='combobox']"
+          );
+        }
+        return false;
+      }
+
+      function shouldProtectShortcut(event) {
+        const key = (event.key || "").toLowerCase();
+        const hasModifier = event.metaKey || event.ctrlKey;
+        if (!hasModifier) {
+          return false;
+        }
+        if (!["a", "c", "v", "x", "z", "y"].includes(key)) {
+          return false;
+        }
+        return isEditableTarget(event.target) || hasTextSelection();
+      }
+
+      function stopForStreamlit(event) {
+        event.stopPropagation();
+        if (typeof event.stopImmediatePropagation === "function") {
+          event.stopImmediatePropagation();
+        }
+      }
+
+      function handler(event) {
+        if (shouldProtectShortcut(event)) {
+          stopForStreamlit(event);
+        }
+      }
+
+      parentDocument.addEventListener("keydown", handler, true);
+      parentDocument.addEventListener("keyup", handler, true);
+      parentDocument.addEventListener("keypress", handler, true);
+    })();
+    </script>
+    """,
+    height=0,
+)
+
 
 # Force light theme
 st.markdown(
@@ -547,7 +980,7 @@ st.markdown(
     unsafe_allow_html=True,
 )
 
-foods, dishes, dings, goals, logs = load_all()
+foods, dishes, dings, goals, logs, batches, batch_ings = load_all()
 
 if not foods.empty:
     foods = foods.apply(normalize_food_row, axis=1)
@@ -558,14 +991,22 @@ tabs = st.tabs(["Log", "Day View", "Dashboard", "Master Data"])
 
 # --------- Tab 1: Log ---------
 with tabs[0]:
+    log_message = st.session_state.pop("log_message", None)
+    if log_message:
+        st.success(log_message)
     st.subheader("Add entry")
     c1, c2 = st.columns([1, 1])
     with c1:
-        log_date = st.date_input("Date", value=date.today(), key="log_date")
+        log_date = st.date_input(
+            "Date",
+            value=date.today(),
+            format=DATE_INPUT_FORMAT,
+            key="log_date",
+        )
         meal = st.selectbox(
             "Meal", ["Breakfast", "Lunch", "Dinner", "Snacks"], index=0, key="log_meal"
         )
-        entry_type = st.radio("Type", ["Food", "Dish"], horizontal=True, key="log_type")
+        entry_type = st.radio("Type", ["Food", "Dish", "Batch"], horizontal=True, key="log_type")
     with c2:
         qty = st.number_input(
             "Quantity", min_value=0.0, step=1.0, value=1.0, key="log_qty"
@@ -599,11 +1040,13 @@ with tabs[0]:
                         logs, log_date, meal, "food", f_name, unit, qty, est_c, est_p
                     )
                     save_df(logs, LOGS_CSV)
-                    st.success("Entry added.")
+                    clear_log_form()
+                    st.session_state.log_message = "Entry added."
+                    st.rerun()
             else:
                 st.warning("Food+unit not found.")
 
-    else:  # Dish
+    elif entry_type == "Dish":
         dish_names = sorted(dishes["dish_name"].unique().tolist())
         if not dish_names:
             st.info("Add dishes in Master Data first.")
@@ -663,7 +1106,90 @@ with tabs[0]:
                     logs, log_date, meal, "dish", d_name, log_unit, qty, est_c, est_p
                 )
                 save_df(logs, LOGS_CSV)
-                st.success("Entry added.")
+                clear_log_form()
+                st.session_state.log_message = "Entry added."
+                st.rerun()
+    else:  # Batch
+        if batches.empty:
+            st.info("Create a batch in Master Data first.")
+        else:
+            batch_options = sorted(
+                [(batch_key(row), row["batch_id"]) for _, row in batches.iterrows()],
+                key=lambda item: item[0],
+            )
+            selected_batch_label = st.selectbox(
+                "Batch",
+                [label for label, _ in batch_options],
+                key="log_batch_sel",
+            )
+            batch_id = dict(batch_options)[selected_batch_label]
+            batch_row = get_batch_row(batches, batch_id)
+            batch_metrics = get_batch_metrics(batch_row)
+            log_options = get_batch_log_options(batch_row)
+            option_labels = [label for _, label in log_options]
+            option_map = {label: unit for unit, label in log_options}
+            selected_label = st.selectbox("Log by", option_labels, key="log_batch_basis")
+            log_unit = option_map[selected_label]
+            base_c, base_p = compute_batch_base(batch_row, log_unit)
+            basis_label = get_dish_basis_label(log_unit)
+            est_c = qty * base_c
+            est_p = qty * base_p
+
+            info_cols = st.columns(2)
+            with info_cols[0]:
+                st.metric("Calories per serving", f"{batch_metrics['per_serving_calories']:.1f}")
+                st.metric("Protein per serving (g)", f"{batch_metrics['per_serving_protein']:.2f}")
+            with info_cols[1]:
+                if batch_metrics["has_weight_basis"]:
+                    source_label = (
+                        "Manual final weight"
+                        if as_text(batch_row.get("yield_source")) != "auto"
+                        else "Auto final weight"
+                    )
+                    st.metric(
+                        f"Calories per {batch_metrics['final_unit']}",
+                        f"{batch_metrics['per_weight_calories']:.2f}",
+                    )
+                    st.metric(
+                        f"Protein per {batch_metrics['final_unit']} (g)",
+                        f"{batch_metrics['per_weight_protein']:.3f}",
+                    )
+                    st.caption(
+                        f"{source_label}: {batch_metrics['final_qty']:.0f} {batch_metrics['final_unit']} total, "
+                        f"{batch_metrics['servings']:.0f} servings, "
+                        f"{batch_metrics['final_qty'] / batch_metrics['servings']:.1f} {batch_metrics['final_unit']} per serving."
+                    )
+                else:
+                    st.caption(
+                        "This batch only supports serving-based logging because no final weight was saved."
+                    )
+
+            st.metric(f"Calories {basis_label}", f"{base_c:.2f}")
+            st.metric(f"Protein {basis_label} (g)", f"{base_p:.3f}")
+            st.metric("Calories (this entry)", f"{est_c:.0f}")
+            st.metric("Protein (this entry, g)", f"{est_p:.1f}")
+            if st.button(
+                "Add to log",
+                type="primary",
+                use_container_width=True,
+                key="add_batch_log",
+            ):
+                logs = add_log_entry(
+                    logs,
+                    log_date,
+                    meal,
+                    "batch",
+                    batch_row["dish_name"],
+                    log_unit,
+                    qty,
+                    est_c,
+                    est_p,
+                    batch_id=batch_id,
+                )
+                save_df(logs, LOGS_CSV)
+                clear_log_form()
+                st.session_state.log_message = "Entry added."
+                st.rerun()
 
 # --------- Tab 2: Day View ---------
 with tabs[1]:
@@ -671,7 +1197,12 @@ with tabs[1]:
     colA, colB = st.columns([1, 1])
     with colA:
         st.button("Today", key="view_today", on_click=set_view_date_today)
-        view_date = st.date_input("Pick a date", value=date.today(), key="view_date")
+        view_date = st.date_input(
+            "Pick a date",
+            value=date.today(),
+            format=DATE_INPUT_FORMAT,
+            key="view_date",
+        )
     with colB:
         st.write("Daily goals")
 
@@ -732,9 +1263,45 @@ with tabs[1]:
                     st.rerun()
 
     day_logs = logs[logs["date"] == view_date.isoformat()].copy()
+    tot_c, tot_p = daily_totals(logs, view_date)
+    st.markdown("### Daily totals")
+    m1, m2, m3 = st.columns(3)
+    m1.metric("Calories", f"{tot_c:.0f}")
+    m2.metric("Protein (g)", f"{tot_p:.1f}")
+    if gcal is not None and gprot is not None:
+        ok_c = tot_c <= gcal
+        ok_p = tot_p >= gprot
+        status_color = "#2e7d32" if ok_c and ok_p else "#c62828"
+        status_text = "On track" if ok_c and ok_p else "Needs attention"
+        m3.markdown(
+            f"""
+            <div style="font-size:0.78rem;text-transform:uppercase;letter-spacing:0.04em;color:#666;">
+                Overall
+            </div>
+            <div style="font-size:0.95rem;font-weight:700;color:{status_color};line-height:1.35;">
+                {status_text}
+            </div>
+            """,
+            unsafe_allow_html=True,
+        )
+        st.markdown("#### Goal progress")
+        p1, p2 = st.columns(2)
+        with p1:
+            render_goal_progress("Calories", tot_c, float(gcal), good_when_under=True)
+        with p2:
+            render_goal_progress("Protein", tot_p, float(gprot), good_when_under=False)
+    else:
+        m3.caption("Set daily goals to see calorie and protein status.")
+
     if day_logs.empty:
         st.info("No entries for this date.")
     else:
+        day_logs["display_name"] = day_logs["name"]
+        batch_mask = (day_logs["type"] == "batch") & day_logs["batch_id"].notna()
+        day_logs.loc[batch_mask, "display_name"] = day_logs.loc[batch_mask].apply(
+            lambda row: f"{row['name']} [{short_batch_id(row['batch_id'])}]",
+            axis=1,
+        )
         # Show grouped by meal
         for meal_name in ["Breakfast", "Lunch", "Dinner", "Snacks"]:
             sub = day_logs[day_logs["meal"] == meal_name]
@@ -742,11 +1309,11 @@ with tabs[1]:
                 continue
             st.markdown(f"### {meal_name}")
             # mandatory list with per-item breakdown
-            show = sub[["type", "name", "unit", "qty", "calories", "protein"]].copy()
+            show = sub[["type", "display_name", "unit", "qty", "calories", "protein"]].copy()
             show = show.rename(
                 columns={
                     "type": "Type",
-                    "name": "Item",
+                    "display_name": "Item",
                     "unit": "Unit",
                     "qty": "Qty",
                     "calories": "Calories",
@@ -778,34 +1345,6 @@ with tabs[1]:
                 st.rerun()
             else:
                 st.error("Confirmation did not match. No entry was deleted.")
-
-        tot_c, tot_p = daily_totals(logs, view_date)
-        st.markdown("### Daily totals")
-        m1, m2, m3 = st.columns(3)
-        m1.metric("Calories", f"{tot_c:.0f}")
-        m2.metric("Protein (g)", f"{tot_p:.1f}")
-        if gcal is not None and gprot is not None:
-            ok_c = tot_c <= gcal
-            ok_p = tot_p >= gprot
-            status_color = "#2e7d32" if ok_c and ok_p else "#c62828"
-            status_text = (
-                f"{'Under calories' if ok_c else 'Over calories'} | "
-                f"{'Protein met' if ok_p else 'Protein not met'}"
-            )
-            m3.markdown(
-                f"""
-                <div style="font-size:0.78rem;text-transform:uppercase;letter-spacing:0.04em;color:#666;">
-                    Status
-                </div>
-                <div style="font-size:0.95rem;font-weight:700;color:{status_color};line-height:1.35;">
-                    {status_text}
-                </div>
-                """,
-                unsafe_allow_html=True,
-            )
-            m3.caption("Daily goal status")
-            with m3:
-                render_status_pie(ok_c, ok_p)
 
 # --------- Tab 3: Dashboard ---------
 with tabs[2]:
@@ -842,6 +1381,7 @@ with tabs[2]:
             "Under calorie budget (days)", f"{int(days_with_goals['under_cal'].sum())}"
         )
         st.markdown("#### Per-day view")
+        merged["date"] = format_date_series(merged["date"])
         st.dataframe(merged.fillna("—"), use_container_width=True)
 
 # --------- Tab 4: Master Data ---------
@@ -897,7 +1437,8 @@ with tabs[3]:
                         prot_per,
                     ]
                     save_df(foods, FOODS_CSV)
-                    st.success("Food saved.")
+                    clear_add_food_form()
+                    st.session_state.master_data_message = "Food saved."
                     st.rerun()
             else:
                 st.error("Name and unit required.")
@@ -910,175 +1451,181 @@ with tabs[3]:
             foods.assign(key=foods.apply(food_key, axis=1)), use_container_width=True
         )
 
-    section_heading(
-        "Edit a food",
-        "Change a food's name, unit, or nutrition values. Existing food logs are recalculated. If this food is used in dishes, keep propagation on when you are renaming the food or unit.",
-    )
     if not foods.empty:
-        fedit = st.selectbox(
-            "Select food to edit",
-            foods.apply(food_key, axis=1).tolist(),
-            key="edit_food_sel",
+        section_heading(
+            "Edit a food",
+            "Change a food's name, unit, or nutrition values. Existing food logs are recalculated. If this food is used in dishes, keep propagation on when you are renaming the food or unit.",
         )
-        frow = foods[foods.apply(food_key, axis=1) == fedit].iloc[0]
-        old_name, old_unit = frow["food_name"], frow["unit"]
-
-        new_name = st.text_input("Food name", value=old_name, key="edit_food_name")
-        new_unit = st.text_input("Unit", value=old_unit, key="edit_food_unit")
-        new_base_qty = st.number_input(
-            "Base quantity",
-            min_value=1.0,
-            step=1.0,
-            value=float(frow["base_qty"]),
-            key="edit_base_qty",
-        )
-
-        new_cal_base = st.number_input(
-            "Calories for base qty",
-            min_value=0.0,
-            step=1.0,
-            value=float(frow["calories_base"]),
-            key="edit_cal_base",
-        )
-
-        new_prot_base = st.number_input(
-            "Protein for base qty",
-            min_value=0.0,
-            step=0.1,
-            value=float(frow["protein_base"]),
-            key="edit_prot_base",
-        )
-        propagate = st.checkbox(
-            "Also update dish ingredients that reference this food",
-            value=True,
-            key="edit_food_propagate",
-        )
-
-        if st.button("Save changes to food", key="save_food_edit"):
-            new_name = new_name.strip()
-            new_unit = new_unit.strip()
-            duplicate = (
-                (foods.index != frow.name)
-                & (foods["food_name"] == new_name)
-                & (foods["unit"] == new_unit)
+        with st.expander("Edit a food", expanded=False):
+            fedit = st.selectbox(
+                "Select food to edit",
+                foods.apply(food_key, axis=1).tolist(),
+                key="edit_food_sel",
             )
-            if not new_name or not new_unit:
-                st.error("Name and unit required.")
-                st.stop()
-            if duplicate.any():
-                st.error("Another food already uses this name and unit.")
-                st.stop()
+            frow = foods[foods.apply(food_key, axis=1) == fedit].iloc[0]
+            old_name, old_unit = frow["food_name"], frow["unit"]
+            if st.session_state.get("edit_food_loaded_for") != fedit:
+                st.session_state.edit_food_name = old_name
+                st.session_state.edit_food_unit = old_unit
+                st.session_state.edit_base_qty = float(frow["base_qty"])
+                st.session_state.edit_cal_base = float(frow["calories_base"])
+                st.session_state.edit_prot_base = float(frow["protein_base"])
+                st.session_state.edit_food_propagate = True
+                st.session_state.edit_food_loaded_for = fedit
 
-            impacted_before = sorted(
-                dings[
-                    (dings["ingredient_food_name"] == old_name)
-                    & (dings["ingredient_unit"] == old_unit)
-                ]["dish_name"]
-                .unique()
-                .tolist()
+            new_name = st.text_input("Food name", key="edit_food_name")
+            new_unit = st.text_input("Unit", key="edit_food_unit")
+            new_base_qty = st.number_input(
+                "Base quantity",
+                min_value=1.0,
+                step=1.0,
+                key="edit_base_qty",
             )
 
-            # update foods table
-            cal_per = new_cal_base / new_base_qty if new_base_qty > 0 else 0
-            prot_per = new_prot_base / new_base_qty if new_base_qty > 0 else 0
+            new_cal_base = st.number_input(
+                "Calories for base qty",
+                min_value=0.0,
+                step=1.0,
+                key="edit_cal_base",
+            )
 
-            foods.loc[frow.name] = [
-                new_name,
-                new_unit,
-                new_base_qty,
-                new_cal_base,
-                new_prot_base,
-                cal_per,
-                prot_per,
-            ]
-            save_df(foods, FOODS_CSV)
+            new_prot_base = st.number_input(
+                "Protein for base qty",
+                min_value=0.0,
+                step=0.1,
+                key="edit_prot_base",
+            )
+            propagate = st.checkbox(
+                "Also update dish ingredients that reference this food",
+                key="edit_food_propagate",
+            )
 
-            # If name/unit changed, update existing food logs to new identifiers
-            if new_name != old_name or new_unit != old_unit:
-                mask_logs = (
-                    (logs["type"] == "food")
-                    & (logs["name"] == old_name)
-                    & (logs["unit"] == old_unit)
+            if st.button("Save changes to food", key="save_food_edit"):
+                new_name = new_name.strip()
+                new_unit = new_unit.strip()
+                duplicate = (
+                    (foods.index != frow.name)
+                    & (foods["food_name"] == new_name)
+                    & (foods["unit"] == new_unit)
                 )
-                logs.loc[mask_logs, ["name", "unit"]] = [new_name, new_unit]
+                if not new_name or not new_unit:
+                    st.error("Name and unit required.")
+                    st.stop()
+                if duplicate.any():
+                    st.error("Another food already uses this name and unit.")
+                    st.stop()
 
-            # Optionally propagate to dish ingredients
-            if propagate and (new_name != old_name or new_unit != old_unit):
-                mask = (dings["ingredient_food_name"] == old_name) & (
-                    dings["ingredient_unit"] == old_unit
+                impacted_before = sorted(
+                    dings[
+                        (dings["ingredient_food_name"] == old_name)
+                        & (dings["ingredient_unit"] == old_unit)
+                    ]["dish_name"]
+                    .unique()
+                    .tolist()
                 )
-                dings.loc[mask, "ingredient_food_name"] = new_name
-                dings.loc[mask, "ingredient_unit"] = new_unit
-                save_df(dings, DISH_ING_CSV)
-                st.success("References updated.")
 
-            # Recalculate logs that reference this food and any dishes that include it
-            logs = recalc_logs_for_food(logs, foods, new_name, new_unit)
-            impacted_after = sorted(
-                dings[
-                    (dings["ingredient_food_name"] == new_name)
-                    & (dings["ingredient_unit"] == new_unit)
-                ]["dish_name"]
-                .unique()
-                .tolist()
-            )
-            impacted = sorted(set(impacted_before) | set(impacted_after))
-            if impacted:
-                logs = recalc_logs_for_dishes(logs, dishes, dings, foods, impacted)
-            save_df(logs, LOGS_CSV)
+                # update foods table
+                cal_per = new_cal_base / new_base_qty if new_base_qty > 0 else 0
+                prot_per = new_prot_base / new_base_qty if new_base_qty > 0 else 0
 
-            st.success(f"Food {fedit} updated and logs recalculated.")
-            st.rerun()
-
-
-
-    section_heading(
-        "Delete a food",
-        "Remove a food definition. This also deletes direct food logs for that food and removes matching ingredient references from dishes. Type the exact food key before deleting.",
-    )
-    if not foods.empty:
-        fdel = st.selectbox(
-            "Select food to delete",
-            foods.apply(food_key, axis=1).tolist(),
-            key="delete_food_sel",
-        )
-
-        # Preview how many logs/ingredients will be affected
-        frow = foods[foods.apply(food_key, axis=1) == fdel].iloc[0]
-        fname, funit = frow["food_name"], frow["unit"]
-        affected_logs = logs[
-            (logs["type"] == "food") & (logs["name"] == fname) & (logs["unit"] == funit)
-        ]
-        affected_ings = dings[
-            (dings["ingredient_food_name"] == fname)
-            & (dings["ingredient_unit"] == funit)
-        ]
-        st.warning(
-            f"Deleting **{fdel}** will remove {len(affected_logs)} log entries and {len(affected_ings)} dish ingredient references."
-        )
-
-        confirm_name = st.text_input(
-            "Type the exact food name+unit to confirm", key="confirm_food"
-        )
-        if st.button("Delete food", key="delete_food_button"):
-            if confirm_name.strip() == fdel:
-                impacted_dishes = sorted(affected_ings["dish_name"].unique().tolist())
-                logs = logs.drop(affected_logs.index)
-                dings = dings.drop(affected_ings.index)
-                foods = foods.drop(frow.name)
-
-                if impacted_dishes:
-                    logs = recalc_logs_for_dishes(
-                        logs, dishes, dings, foods, impacted_dishes
-                    )
-
+                foods.loc[frow.name] = [
+                    new_name,
+                    new_unit,
+                    new_base_qty,
+                    new_cal_base,
+                    new_prot_base,
+                    cal_per,
+                    prot_per,
+                ]
                 save_df(foods, FOODS_CSV)
-                save_df(dings, DISH_ING_CSV)
+
+                # If name/unit changed, update existing food logs to new identifiers
+                if new_name != old_name or new_unit != old_unit:
+                    mask_logs = (
+                        (logs["type"] == "food")
+                        & (logs["name"] == old_name)
+                        & (logs["unit"] == old_unit)
+                    )
+                    logs.loc[mask_logs, ["name", "unit"]] = [new_name, new_unit]
+
+                # Optionally propagate to dish ingredients
+                if propagate and (new_name != old_name or new_unit != old_unit):
+                    mask = (dings["ingredient_food_name"] == old_name) & (
+                        dings["ingredient_unit"] == old_unit
+                    )
+                    dings.loc[mask, "ingredient_food_name"] = new_name
+                    dings.loc[mask, "ingredient_unit"] = new_unit
+                    save_df(dings, DISH_ING_CSV)
+                    st.success("References updated.")
+
+                # Recalculate logs that reference this food and any dishes that include it
+                logs = recalc_logs_for_food(logs, foods, new_name, new_unit)
+                impacted_after = sorted(
+                    dings[
+                        (dings["ingredient_food_name"] == new_name)
+                        & (dings["ingredient_unit"] == new_unit)
+                    ]["dish_name"]
+                    .unique()
+                    .tolist()
+                )
+                impacted = sorted(set(impacted_before) | set(impacted_after))
+                if impacted:
+                    logs = recalc_logs_for_dishes(logs, dishes, dings, foods, impacted)
                 save_df(logs, LOGS_CSV)
-                st.success(f"Deleted food {fdel}")
+
+                st.success(f"Food {fedit} updated and logs recalculated.")
                 st.rerun()
-            else:
-                st.error("Confirmation did not match. No delete.")
+
+    if not foods.empty:
+        section_heading(
+            "Delete a food",
+            "Remove a food definition. This also deletes direct food logs for that food and removes matching ingredient references from dishes. Type the exact food key before deleting.",
+        )
+        with st.expander("Delete a food", expanded=False):
+            fdel = st.selectbox(
+                "Select food to delete",
+                foods.apply(food_key, axis=1).tolist(),
+                key="delete_food_sel",
+            )
+
+            # Preview how many logs/ingredients will be affected
+            frow = foods[foods.apply(food_key, axis=1) == fdel].iloc[0]
+            fname, funit = frow["food_name"], frow["unit"]
+            affected_logs = logs[
+                (logs["type"] == "food")
+                & (logs["name"] == fname)
+                & (logs["unit"] == funit)
+            ]
+            affected_ings = dings[
+                (dings["ingredient_food_name"] == fname)
+                & (dings["ingredient_unit"] == funit)
+            ]
+            st.warning(
+                f"Deleting **{fdel}** will remove {len(affected_logs)} log entries and {len(affected_ings)} dish ingredient references."
+            )
+
+            confirm_name = st.text_input(
+                "Type the exact food name+unit to confirm", key="confirm_food"
+            )
+            if st.button("Delete food", key="delete_food_button"):
+                if confirm_name.strip() == fdel:
+                    impacted_dishes = sorted(affected_ings["dish_name"].unique().tolist())
+                    logs = logs.drop(affected_logs.index)
+                    dings = dings.drop(affected_ings.index)
+                    foods = foods.drop(frow.name)
+
+                    if impacted_dishes:
+                        logs = recalc_logs_for_dishes(
+                            logs, dishes, dings, foods, impacted_dishes
+                        )
+
+                    save_df(foods, FOODS_CSV)
+                    save_df(dings, DISH_ING_CSV)
+                    save_df(logs, LOGS_CSV)
+                    st.success(f"Deleted food {fdel}")
+                    st.rerun()
+                else:
+                    st.error("Confirmation did not match. No delete.")
 
     section_heading(
         "Dishes",
@@ -1180,7 +1727,8 @@ with tabs[3]:
                 save_df(dishes, DISHES_CSV)
                 logs = recalc_logs_for_dishes(logs, dishes, dings, foods, [dname])
                 save_df(logs, LOGS_CSV)
-                st.success("Dish saved and logs recalculated.")
+                clear_add_dish_form()
+                st.session_state.master_data_message = "Dish saved and logs recalculated."
                 st.rerun()
 
     section_heading(
@@ -1308,7 +1856,8 @@ with tabs[3]:
                     # Recalculate logs for this dish
                     logs = recalc_logs_for_dishes(logs, dishes, dings, foods, [dsel])
                     save_df(logs, LOGS_CSV)
-                    st.success("Ingredient added and logs recalculated.")
+                    clear_add_ingredient_form()
+                    st.session_state.master_data_message = "Ingredient added and logs recalculated."
                     st.rerun()
 
     section_heading(
@@ -1432,8 +1981,304 @@ with tabs[3]:
             st.dataframe(pd.DataFrame(preview), use_container_width=True)
 
     section_heading(
+        "Batches",
+        "Batches are immutable snapshots of one real cook. Create a new batch each time the ingredient quantities, servings, or final weight differ so old logs never change.",
+        level=3,
+    )
+    with st.expander("Create batch from dish"):
+        st.caption(
+            "Use a dish as a template, then change ingredient quantities, servings, and final weight for this one cooked batch. Logging against batches preserves history even if you later change the dish template."
+        )
+        if dishes.empty:
+            st.info("Add at least one dish first.")
+        else:
+            batch_dish_name = st.selectbox(
+                "Dish template",
+                sorted(dishes["dish_name"].tolist()),
+                key="create_batch_dish_name",
+            )
+            template_row = dishes[dishes["dish_name"] == batch_dish_name].iloc[0]
+            template_ings = dings[dings["dish_name"] == batch_dish_name].copy()
+
+            c1, c2 = st.columns(2)
+            with c1:
+                batch_day = st.date_input(
+                    "Batch date",
+                    value=date.today(),
+                    format=DATE_INPUT_FORMAT,
+                    key="create_batch_date",
+                )
+                batch_servings = st.number_input(
+                    "Batch servings",
+                    min_value=1.0,
+                    step=1.0,
+                    value=float(template_row["servings"])
+                    if pd.notna(template_row["servings"])
+                    else 1.0,
+                    key=f"create_batch_servings_{batch_dish_name}",
+                )
+            with c2:
+                batch_final_qty = st.number_input(
+                    "Final batch quantity",
+                    min_value=0.0,
+                    step=1.0,
+                    value=0.0,
+                    key=f"create_batch_final_qty_{batch_dish_name}",
+                )
+                batch_final_unit = st.text_input(
+                    "Final batch unit",
+                    value="",
+                    key=f"create_batch_final_unit_{batch_dish_name}",
+                )
+
+            batch_notes = st.text_input(
+                "Notes",
+                key=f"create_batch_notes_{batch_dish_name}",
+                placeholder="Optional note like thinner than usual, extra water, etc.",
+            )
+
+            batch_ingredient_rows = []
+            if is_override_dish(template_row):
+                st.info(
+                    "This template uses manual override macros. The batch will snapshot total macros from the dish template and batch servings."
+                )
+            elif template_ings.empty:
+                st.warning("This dish has no ingredients yet.")
+            else:
+                st.write("Ingredient snapshot for this batch")
+                for i, ing in template_ings.iterrows():
+                    qty_key = f"create_batch_qty_{batch_dish_name}_{i}"
+                    c1, c2, c3 = st.columns([4, 2, 2])
+                    with c1:
+                        st.write(f"{ing['ingredient_food_name']} [{ing['ingredient_unit']}]")
+                    with c2:
+                        qty_value = st.number_input(
+                            "Qty",
+                            min_value=0.0,
+                            step=1.0,
+                            value=float(ing["ingredient_qty_per_serving"]),
+                            key=qty_key,
+                            label_visibility="collapsed",
+                        )
+                    with c3:
+                        frow = get_food_row(
+                            foods,
+                            ing["ingredient_food_name"],
+                            ing["ingredient_unit"],
+                        )
+                        if frow is None:
+                            st.caption("Food missing")
+                        else:
+                            est_c = qty_value * as_float(frow["cal_per_unit"], 0.0)
+                            est_p = qty_value * as_float(frow["protein_per_unit"], 0.0)
+                            st.caption(f"{est_c:.0f} kcal | {est_p:.1f}g")
+                    if qty_value > 0:
+                        batch_ingredient_rows.append(
+                            {
+                                "ingredient_food_name": ing["ingredient_food_name"],
+                                "ingredient_unit": ing["ingredient_unit"],
+                                "ingredient_qty": qty_value,
+                            }
+                        )
+
+            preview_metrics = None
+            if is_override_dish(template_row):
+                total_c = as_float(template_row["cal_override"], 0.0) * batch_servings
+                total_p = as_float(template_row["protein_override"], 0.0) * batch_servings
+                preview_metrics = build_portion_metrics(
+                    batch_servings,
+                    total_c,
+                    total_p,
+                    batch_final_qty if batch_final_qty > 0 else 0.0,
+                    batch_final_unit.strip(),
+                )
+            elif batch_ingredient_rows:
+                batch_ingredients_df = pd.DataFrame(batch_ingredient_rows)
+                total_c, total_p = compute_ingredient_totals(
+                    batch_ingredients_df, foods, "ingredient_qty"
+                )
+                auto_qty, auto_unit = get_auto_yield_from_ingredients(
+                    batch_ingredients_df, "ingredient_qty"
+                )
+                preview_metrics = build_portion_metrics(
+                    batch_servings,
+                    total_c,
+                    total_p,
+                    batch_final_qty if batch_final_qty > 0 else 0.0,
+                    batch_final_unit.strip(),
+                    auto_qty,
+                    auto_unit,
+                )
+
+            if preview_metrics is not None:
+                p1, p2, p3 = st.columns(3)
+                p1.metric("Batch calories", f"{preview_metrics['total_calories']:.0f}")
+                p2.metric("Batch protein (g)", f"{preview_metrics['total_protein']:.1f}")
+                source_label = preview_metrics["yield_source"] or "none"
+                p3.metric("Final qty source", source_label)
+                st.caption(
+                    f"Per serving: {preview_metrics['per_serving_calories']:.1f} kcal, "
+                    f"{preview_metrics['per_serving_protein']:.2f}g protein."
+                )
+                if preview_metrics["has_weight_basis"]:
+                    st.caption(
+                        f"Per {preview_metrics['final_unit']}: "
+                        f"{preview_metrics['per_weight_calories']:.3f} kcal, "
+                        f"{preview_metrics['per_weight_protein']:.4f}g protein."
+                    )
+
+            c1, c2 = st.columns(2)
+            with c1:
+                save_batch = st.button("Save batch", key="save_batch")
+            with c2:
+                st.button(
+                    "Clear batch form",
+                    key="clear_create_batch",
+                    on_click=clear_create_batch_form,
+                )
+
+            if save_batch:
+                batch_final_unit = batch_final_unit.strip()
+                if batch_final_qty > 0 and not batch_final_unit:
+                    st.error("Final batch unit is required when final batch quantity is set.")
+                elif not is_override_dish(template_row) and not batch_ingredient_rows:
+                    st.error("This batch needs at least one ingredient quantity greater than 0.")
+                else:
+                    batch_id = make_batch_id(batch_day)
+                    if preview_metrics is None:
+                        preview_metrics = build_portion_metrics(batch_servings, 0.0, 0.0, 0.0, "")
+
+                    batches.loc[len(batches)] = [
+                        batch_id,
+                        batch_dish_name,
+                        batch_day.isoformat(),
+                        batch_servings,
+                        preview_metrics["final_qty"] if preview_metrics["has_weight_basis"] else None,
+                        preview_metrics["final_unit"] if preview_metrics["has_weight_basis"] else None,
+                        preview_metrics["yield_source"],
+                        preview_metrics["total_calories"],
+                        preview_metrics["total_protein"],
+                        batch_notes.strip(),
+                    ]
+
+                    if batch_ingredient_rows:
+                        batch_ingredients_to_save = pd.DataFrame(batch_ingredient_rows)
+                        batch_ingredients_to_save.insert(0, "batch_id", batch_id)
+                        batch_ings = pd.concat(
+                            [batch_ings, batch_ingredients_to_save[BATCH_INGREDIENT_COLUMNS]],
+                            ignore_index=True,
+                        )
+                        save_df(batch_ings, BATCH_ING_CSV)
+
+                    save_df(batches, BATCHES_CSV)
+                    clear_create_batch_form()
+                    st.session_state.master_data_message = "Batch saved."
+                    st.rerun()
+
+    with st.expander("View batches table", expanded=False):
+        st.caption(
+            "Batches are historical snapshots. Their totals, servings, and final weight stay fixed even if you later edit the dish template."
+        )
+        if batches.empty:
+            st.info("No batches yet.")
+        else:
+            preview = batches.copy()
+            preview["batch_date"] = format_date_series(preview["batch_date"])
+            preview["batch_label"] = preview.apply(batch_key, axis=1)
+            preview["calories_per_serving"] = preview.apply(
+                lambda row: as_float(row["total_calories"], 0.0)
+                / max(as_float(row["servings"], 1.0), 1.0),
+                axis=1,
+            )
+            preview["protein_per_serving"] = preview.apply(
+                lambda row: as_float(row["total_protein"], 0.0)
+                / max(as_float(row["servings"], 1.0), 1.0),
+                axis=1,
+            )
+            preview["calories_per_final_unit"] = preview.apply(
+                lambda row: as_float(row["total_calories"], 0.0) / as_float(row["final_qty"], 0.0)
+                if as_float(row["final_qty"], 0.0) > 0 and as_text(row["final_unit"])
+                else None,
+                axis=1,
+            )
+            preview["protein_per_final_unit"] = preview.apply(
+                lambda row: as_float(row["total_protein"], 0.0) / as_float(row["final_qty"], 0.0)
+                if as_float(row["final_qty"], 0.0) > 0 and as_text(row["final_unit"])
+                else None,
+                axis=1,
+            )
+            st.dataframe(
+                preview[
+                    [
+                        "batch_label",
+                        "dish_name",
+                        "batch_date",
+                        "servings",
+                        "final_qty",
+                        "final_unit",
+                        "yield_source",
+                        "total_calories",
+                        "total_protein",
+                        "calories_per_serving",
+                        "protein_per_serving",
+                        "calories_per_final_unit",
+                        "protein_per_final_unit",
+                        "notes",
+                    ]
+                ],
+                use_container_width=True,
+            )
+
+            bsel = st.selectbox(
+                "Preview ingredients for batch",
+                batches.apply(batch_key, axis=1).tolist(),
+                key="view_batch_ingredients_sel",
+            )
+            batch_row = batches[batches.apply(batch_key, axis=1) == bsel].iloc[0]
+            batch_ing_view = batch_ings[batch_ings["batch_id"] == batch_row["batch_id"]].copy()
+            if batch_ing_view.empty:
+                st.info("No batch ingredient snapshot stored for this batch.")
+            else:
+                st.dataframe(batch_ing_view, hide_index=True, use_container_width=True)
+
+    section_heading(
+        "Delete a batch",
+        "Remove a batch snapshot and any logs created from that batch. This does not delete the underlying dish template.",
+    )
+    if not batches.empty:
+        bdel = st.selectbox(
+            "Select batch to delete",
+            batches.apply(batch_key, axis=1).tolist(),
+            key="delete_batch_sel",
+        )
+        brow = batches[batches.apply(batch_key, axis=1) == bdel].iloc[0]
+        affected_batch_logs = logs[
+            (logs["type"] == "batch") & (logs["batch_id"] == brow["batch_id"])
+        ]
+        affected_batch_ings = batch_ings[batch_ings["batch_id"] == brow["batch_id"]]
+        st.warning(
+            f"Deleting this batch will remove {len(affected_batch_logs)} batch log entries and {len(affected_batch_ings)} batch ingredient snapshot rows."
+        )
+        confirm_batch = st.text_input(
+            "Type the exact batch label to confirm",
+            key="confirm_batch_delete",
+        )
+        if st.button("Delete batch", key="delete_batch_button"):
+            if confirm_batch.strip() == bdel:
+                logs = logs.drop(affected_batch_logs.index)
+                batches = batches[batches["batch_id"] != brow["batch_id"]]
+                batch_ings = batch_ings[batch_ings["batch_id"] != brow["batch_id"]]
+                save_df(logs, LOGS_CSV)
+                save_df(batches, BATCHES_CSV)
+                save_df(batch_ings, BATCH_ING_CSV)
+                st.success("Batch deleted.")
+                st.rerun()
+            else:
+                st.error("Confirmation did not match. No delete.")
+
+    section_heading(
         "Delete a dish",
-        "Remove a dish, its ingredients, and any logged entries for that dish. Type the exact dish name before deleting.",
+        "Remove a dish template, its ingredients, and any direct dish-template logs. Existing historical batches stay intact. Type the exact dish name before deleting.",
     )
     if not dishes.empty:
         ddel = st.selectbox(
@@ -1444,8 +2289,9 @@ with tabs[3]:
 
         affected_logs = logs[(logs["type"] == "dish") & (logs["name"] == ddel)]
         affected_ings = dings[dings["dish_name"] == ddel]
+        affected_batches = batches[batches["dish_name"] == ddel]
         st.warning(
-            f"Deleting **{ddel}** will remove {len(affected_logs)} log entries and {len(affected_ings)} ingredients."
+            f"Deleting **{ddel}** will remove {len(affected_logs)} direct dish log entries and {len(affected_ings)} template ingredients. {len(affected_batches)} historical batches will be kept."
         )
 
         confirm_dish = st.text_input(
@@ -1485,7 +2331,12 @@ with tabs[3]:
         st.caption(
             "Set one day's targets. Example: May 3 has 1800 kcal and 120g protein; changing May 3 does not change other days."
         )
-        day = st.date_input("Date for goal", value=date.today(), key="goal_date")
+        day = st.date_input(
+            "Date for goal",
+            value=date.today(),
+            format=DATE_INPUT_FORMAT,
+            key="goal_date",
+        )
         cal_goal = st.number_input(
             "Calorie goal", min_value=0.0, step=50.0, value=1800.0, key="cal_goal2"
         )
@@ -1498,7 +2349,8 @@ with tabs[3]:
             else:
                 goals = upsert_goal(goals, day, cal_goal, prot_goal)
                 save_df(goals, GOALS_CSV)
-                st.success("Goal saved.")
+                clear_single_goal_form()
+                st.session_state.master_data_message = "Goal saved."
                 st.rerun()
 
     with st.expander("Bulk set goals for a date range"):
@@ -1508,11 +2360,17 @@ with tabs[3]:
         r1, r2 = st.columns(2)
         with r1:
             start_day = st.date_input(
-                "Start date", value=date.today(), key="bulk_start"
+                "Start date",
+                value=date.today(),
+                format=DATE_INPUT_FORMAT,
+                key="bulk_start",
             )
         with r2:
             end_day = st.date_input(
-                "End date (inclusive)", value=date.today(), key="bulk_end"
+                "End date (inclusive)",
+                value=date.today(),
+                format=DATE_INPUT_FORMAT,
+                key="bulk_end",
             )
         bcal = st.number_input(
             "Calorie goal (range)",
@@ -1542,14 +2400,17 @@ with tabs[3]:
                     goals = upsert_goal(goals, cur, bcal, bprot)
                     cur += timedelta(days=1)
                 save_df(goals, GOALS_CSV)
-                st.success("Goals applied to range.")
+                clear_bulk_goal_form()
+                st.session_state.master_data_message = "Goals applied to range."
                 st.rerun()
 
     with st.expander("View all goals", expanded=False):
         st.caption(
             "Read-only view of saved goal rows. Use Clear goals below if old test goals are cluttering this table."
         )
-        st.dataframe(goals.sort_values("date"), use_container_width=True)
+        goals_view = goals.sort_values("date").copy()
+        goals_view["date"] = format_date_series(goals_view["date"])
+        st.dataframe(goals_view, use_container_width=True)
 
     with st.expander("Clear goals", expanded=False):
         st.caption(
@@ -1594,7 +2455,8 @@ with tabs[3]:
             "This removes every food, dish, ingredient, goal, and log row from the local CSV files. The files and headers stay in place."
         )
         st.write(
-            f"Current rows: {len(foods)} foods, {len(dishes)} dishes, {len(dings)} ingredients, {len(goals)} goals, {len(logs)} logs."
+            f"Current rows: {len(foods)} foods, {len(dishes)} dishes, {len(dings)} dish ingredients, "
+            f"{len(batches)} batches, {len(batch_ings)} batch ingredients, {len(goals)} goals, {len(logs)} logs."
         )
         confirm_reset_all = st.text_input(
             "Type RESET ALL DATA to confirm",

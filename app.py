@@ -2,6 +2,7 @@
 # MVP: meals, units, foods+dishes, per-day goal locking, calendar view, mandatory list, dashboard
 
 import streamlit as st
+import streamlit.components.v1 as components
 import pandas as pd
 import io
 from pathlib import Path
@@ -865,6 +866,84 @@ def recalc_logs_for_dishes(
 
 # ---------- UI ----------
 st.set_page_config(page_title="Shoku", page_icon="🍱", layout="wide")
+
+components.html(
+    """
+    <script>
+    (function () {
+      const parentWindow = window.parent;
+      const parentDocument = parentWindow.document;
+      if (parentWindow.__shokuKeyboardFixInstalled) {
+        return;
+      }
+      parentWindow.__shokuKeyboardFixInstalled = true;
+
+      function hasTextSelection() {
+        try {
+          const selection = parentWindow.getSelection();
+          return !!selection && String(selection).length > 0;
+        } catch (error) {
+          return false;
+        }
+      }
+
+      function isEditableTarget(target) {
+        if (!target) {
+          return false;
+        }
+        const tagName = (target.tagName || "").toLowerCase();
+        if (target.isContentEditable || tagName === "input" || tagName === "textarea") {
+          return true;
+        }
+        if (typeof target.closest === "function") {
+          return !!target.closest("[contenteditable='true'], input, textarea, [role='textbox']");
+        }
+        return false;
+      }
+
+      function shouldProtectShortcut(event) {
+        const key = (event.key || "").toLowerCase();
+        const hasModifier = event.metaKey || event.ctrlKey;
+        if (!hasModifier) {
+          return false;
+        }
+        if (!["a", "c", "v", "x", "z", "y"].includes(key)) {
+          return false;
+        }
+        return isEditableTarget(event.target) || hasTextSelection();
+      }
+
+      function shouldProtectTyping(event) {
+        if (!isEditableTarget(event.target)) {
+          return false;
+        }
+        if (event.metaKey || event.ctrlKey || event.altKey) {
+          return false;
+        }
+        return true;
+      }
+
+      function stopForStreamlit(event) {
+        event.stopPropagation();
+        if (typeof event.stopImmediatePropagation === "function") {
+          event.stopImmediatePropagation();
+        }
+      }
+
+      function handler(event) {
+        if (shouldProtectShortcut(event) || shouldProtectTyping(event)) {
+          stopForStreamlit(event);
+        }
+      }
+
+      parentDocument.addEventListener("keydown", handler, true);
+      parentDocument.addEventListener("keyup", handler, true);
+      parentDocument.addEventListener("keypress", handler, true);
+    })();
+    </script>
+    """,
+    height=0,
+)
 
 
 # Force light theme

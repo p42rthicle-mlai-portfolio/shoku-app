@@ -556,28 +556,50 @@ def clear_session_keys(keys):
         st.session_state.pop(key, None)
 
 
-def render_status_pie(calories_ok: bool, protein_ok: bool):
+def render_goal_progress(
+    label: str, consumed: float, goal: float, good_when_under: bool
+):
     green = "#2e7d32"
     red = "#c62828"
-    calorie_color = green if calories_ok else red
-    protein_color = green if protein_ok else red
-    calorie_label = "Under budget" if calories_ok else "Over budget"
-    protein_label = "Goal met" if protein_ok else "Not met"
-    gradient = f"{calorie_color} 0 50%, {protein_color} 50% 100%"
+    track = "#ebedf0"
+    if goal <= 0:
+        fill_pct = 0.0
+        ok = False
+    else:
+        fill_pct = min(consumed / goal, 1.0) * 100
+        ok = consumed <= goal if good_when_under else consumed >= goal
+    color = green if ok else red
+    status = (
+        "Under budget" if good_when_under and ok else
+        "Over budget" if good_when_under else
+        "Goal met" if ok else
+        "Not met"
+    )
 
     st.markdown(
         f"""
-        <div style="display:flex;align-items:center;gap:12px;margin-top:4px;">
-            <div aria-label="Daily status pie chart" style="
-                width:64px;
-                height:64px;
-                border-radius:50%;
-                background:conic-gradient({gradient});
-                border:1px solid rgba(0,0,0,0.12);
-            "></div>
-            <div style="font-size:0.85rem;line-height:1.35;">
-                <div><span style="font-weight:700;">Calories</span>: <span style="color:{calorie_color};font-weight:700;">{calorie_label}</span></div>
-                <div><span style="font-weight:700;">Protein</span>: <span style="color:{protein_color};font-weight:700;">{protein_label}</span></div>
+        <div style="margin-top:6px;">
+            <div style="display:flex;justify-content:space-between;align-items:baseline;gap:12px;">
+                <div style="font-size:0.92rem;font-weight:700;color:#1f2937;">{label}</div>
+                <div style="font-size:0.85rem;font-weight:700;color:{color};">{status}</div>
+            </div>
+            <div style="
+                margin-top:6px;
+                width:100%;
+                height:12px;
+                border-radius:999px;
+                background:{track};
+                overflow:hidden;
+            ">
+                <div style="
+                    width:{fill_pct:.1f}%;
+                    height:100%;
+                    background:{color};
+                    border-radius:999px;
+                "></div>
+            </div>
+            <div style="margin-top:6px;font-size:0.82rem;color:#666;">
+                {consumed:.1f} consumed / {goal:.1f} goal
             </div>
         </div>
         """,
@@ -1250,14 +1272,11 @@ with tabs[1]:
         ok_c = tot_c <= gcal
         ok_p = tot_p >= gprot
         status_color = "#2e7d32" if ok_c and ok_p else "#c62828"
-        status_text = (
-            f"{'Under calories' if ok_c else 'Over calories'} | "
-            f"{'Protein met' if ok_p else 'Protein not met'}"
-        )
+        status_text = "On track" if ok_c and ok_p else "Needs attention"
         m3.markdown(
             f"""
             <div style="font-size:0.78rem;text-transform:uppercase;letter-spacing:0.04em;color:#666;">
-                Status
+                Overall
             </div>
             <div style="font-size:0.95rem;font-weight:700;color:{status_color};line-height:1.35;">
                 {status_text}
@@ -1265,9 +1284,12 @@ with tabs[1]:
             """,
             unsafe_allow_html=True,
         )
-        m3.caption("Daily goal status")
-        with m3:
-            render_status_pie(ok_c, ok_p)
+        st.markdown("#### Goal progress")
+        p1, p2 = st.columns(2)
+        with p1:
+            render_goal_progress("Calories", tot_c, float(gcal), good_when_under=True)
+        with p2:
+            render_goal_progress("Protein", tot_p, float(gprot), good_when_under=False)
     else:
         m3.caption("Set daily goals to see calorie and protein status.")
 

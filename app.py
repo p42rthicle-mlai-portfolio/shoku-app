@@ -89,6 +89,7 @@ DISH_INGREDIENT_COLUMNS = [
 ]
 GOAL_COLUMNS = ["date", "calorie_goal", "protein_goal"]
 LOG_COLUMNS = ["date", "meal", "type", "name", "unit", "qty", "calories", "protein"]
+DATE_INPUT_FORMAT = "DD/MM/YYYY"
 
 # ---------- Utilities ----------
 
@@ -172,6 +173,28 @@ def as_text(value) -> str:
     if pd.isna(value):
         return ""
     return str(value).strip()
+
+
+def parse_date_value(value):
+    if isinstance(value, date):
+        return value
+    if pd.isna(value):
+        return None
+    parsed = pd.to_datetime(value, errors="coerce")
+    if pd.isna(parsed):
+        return None
+    return parsed.date()
+
+
+def format_day(day_value) -> str:
+    parsed = parse_date_value(day_value)
+    if parsed is None:
+        return ""
+    return parsed.strftime("%d/%m/%Y")
+
+
+def format_date_series(values: pd.Series) -> pd.Series:
+    return values.apply(format_day)
 
 
 def get_food_row(foods: pd.DataFrame, food_name: str, unit: str):
@@ -561,7 +584,12 @@ with tabs[0]:
     st.subheader("Add entry")
     c1, c2 = st.columns([1, 1])
     with c1:
-        log_date = st.date_input("Date", value=date.today(), key="log_date")
+        log_date = st.date_input(
+            "Date",
+            value=date.today(),
+            format=DATE_INPUT_FORMAT,
+            key="log_date",
+        )
         meal = st.selectbox(
             "Meal", ["Breakfast", "Lunch", "Dinner", "Snacks"], index=0, key="log_meal"
         )
@@ -671,7 +699,12 @@ with tabs[1]:
     colA, colB = st.columns([1, 1])
     with colA:
         st.button("Today", key="view_today", on_click=set_view_date_today)
-        view_date = st.date_input("Pick a date", value=date.today(), key="view_date")
+        view_date = st.date_input(
+            "Pick a date",
+            value=date.today(),
+            format=DATE_INPUT_FORMAT,
+            key="view_date",
+        )
     with colB:
         st.write("Daily goals")
 
@@ -842,6 +875,7 @@ with tabs[2]:
             "Under calorie budget (days)", f"{int(days_with_goals['under_cal'].sum())}"
         )
         st.markdown("#### Per-day view")
+        merged["date"] = format_date_series(merged["date"])
         st.dataframe(merged.fillna("—"), use_container_width=True)
 
 # --------- Tab 4: Master Data ---------
@@ -1485,7 +1519,12 @@ with tabs[3]:
         st.caption(
             "Set one day's targets. Example: May 3 has 1800 kcal and 120g protein; changing May 3 does not change other days."
         )
-        day = st.date_input("Date for goal", value=date.today(), key="goal_date")
+        day = st.date_input(
+            "Date for goal",
+            value=date.today(),
+            format=DATE_INPUT_FORMAT,
+            key="goal_date",
+        )
         cal_goal = st.number_input(
             "Calorie goal", min_value=0.0, step=50.0, value=1800.0, key="cal_goal2"
         )
@@ -1508,11 +1547,17 @@ with tabs[3]:
         r1, r2 = st.columns(2)
         with r1:
             start_day = st.date_input(
-                "Start date", value=date.today(), key="bulk_start"
+                "Start date",
+                value=date.today(),
+                format=DATE_INPUT_FORMAT,
+                key="bulk_start",
             )
         with r2:
             end_day = st.date_input(
-                "End date (inclusive)", value=date.today(), key="bulk_end"
+                "End date (inclusive)",
+                value=date.today(),
+                format=DATE_INPUT_FORMAT,
+                key="bulk_end",
             )
         bcal = st.number_input(
             "Calorie goal (range)",
@@ -1549,7 +1594,9 @@ with tabs[3]:
         st.caption(
             "Read-only view of saved goal rows. Use Clear goals below if old test goals are cluttering this table."
         )
-        st.dataframe(goals.sort_values("date"), use_container_width=True)
+        goals_view = goals.sort_values("date").copy()
+        goals_view["date"] = format_date_series(goals_view["date"])
+        st.dataframe(goals_view, use_container_width=True)
 
     with st.expander("Clear goals", expanded=False):
         st.caption(

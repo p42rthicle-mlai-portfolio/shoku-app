@@ -2431,15 +2431,25 @@ with tabs[3]:
             )
             st.session_state[batch_edit_loaded_key] = batch_id
 
-            edit_servings = st.number_input(
-                "Batch servings",
-                min_value=1.0,
-                step=1.0,
-                value=float(brow["servings"]) if pd.notna(brow["servings"]) else 1.0,
-                key=f"edit_batch_servings_{batch_id}",
-            )
-            c1, c2 = st.columns(2)
+            c0, c1, c2 = st.columns(3)
+            with c0:
+                edit_batch_date = st.date_input(
+                    "Batch date",
+                    value=date.fromisoformat(as_text(brow["batch_date"]))
+                    if as_text(brow["batch_date"])
+                    else date.today(),
+                    format=DATE_INPUT_FORMAT,
+                    key=f"edit_batch_date_{batch_id}",
+                )
             with c1:
+                edit_servings = st.number_input(
+                    "Batch servings",
+                    min_value=1.0,
+                    step=1.0,
+                    value=float(brow["servings"]) if pd.notna(brow["servings"]) else 1.0,
+                    key=f"edit_batch_servings_{batch_id}",
+                )
+            with c2:
                 edit_final_qty = st.number_input(
                     "Final batch quantity",
                     min_value=0.0,
@@ -2447,7 +2457,8 @@ with tabs[3]:
                     value=as_float(brow["final_qty"], 0.0),
                     key=f"edit_batch_final_qty_{batch_id}",
                 )
-            with c2:
+            c1, c2 = st.columns(2)
+            with c1:
                 edit_final_unit = st.text_input(
                     "Final batch unit",
                     value=as_text(brow["final_unit"]),
@@ -2631,7 +2642,14 @@ with tabs[3]:
                             edit_servings, 0.0, 0.0, 0.0, ""
                         )
 
+                    new_batch_id = (
+                        batch_id
+                        if as_text(brow["batch_date"]) == edit_batch_date.isoformat()
+                        else make_batch_id(edit_batch_date)
+                    )
                     batch_index = brow.name
+                    batches.loc[batch_index, "batch_id"] = new_batch_id
+                    batches.loc[batch_index, "batch_date"] = edit_batch_date.isoformat()
                     batches.loc[batch_index, "servings"] = edit_servings
                     batches.loc[batch_index, "final_qty"] = (
                         edit_preview_metrics["final_qty"] if edit_preview_metrics["has_weight_basis"] else None
@@ -2644,16 +2662,20 @@ with tabs[3]:
                     batches.loc[batch_index, "total_protein"] = edit_preview_metrics["total_protein"]
                     batches.loc[batch_index, "notes"] = edit_notes.strip()
 
+                    logs.loc[
+                        (logs["type"] == "batch") & (logs["batch_id"] == batch_id),
+                        "batch_id",
+                    ] = new_batch_id
                     batch_ings = batch_ings[batch_ings["batch_id"] != batch_id]
                     if edit_batch_ingredient_rows:
                         edit_batch_ingredients_to_save = pd.DataFrame(edit_batch_ingredient_rows)
-                        edit_batch_ingredients_to_save.insert(0, "batch_id", batch_id)
+                        edit_batch_ingredients_to_save.insert(0, "batch_id", new_batch_id)
                         batch_ings = pd.concat(
                             [batch_ings, edit_batch_ingredients_to_save[BATCH_INGREDIENT_COLUMNS]],
                             ignore_index=True,
                         )
 
-                    updated_batch_row = get_batch_row(batches, batch_id)
+                    updated_batch_row = get_batch_row(batches, new_batch_id)
                     logs = recalc_logs_for_batch(logs, updated_batch_row)
 
                     save_df(batches, BATCHES_CSV)

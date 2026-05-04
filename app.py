@@ -291,48 +291,146 @@ def get_dish_yield(row) -> Tuple[float, str]:
     return 0.0, ""
 
 
-def get_dish_log_unit(dish_name: str, dishes: pd.DataFrame) -> str:
-    md = dishes[dishes["dish_name"] == dish_name]
-    if md.empty:
-        return "serving"
-    row = md.iloc[0]
-    if is_override_dish(row):
-        return "serving"
-    _, yield_unit = get_dish_yield(row)
-    return yield_unit or "serving"
+def get_dish_servings(row) -> float:
+    servings = as_float(row.get("servings"), 1.0)
+    return servings if servings > 0 else 1.0
 
 
-def get_dish_basis_label(dish_name: str, dishes: pd.DataFrame) -> str:
-    unit = get_dish_log_unit(dish_name, dishes)
-    return f"per {unit}"
-
-
-def compute_dish_base(
+def compute_dish_totals(
     dish_name: str, dishes: pd.DataFrame, dings: pd.DataFrame, foods: pd.DataFrame
 ) -> Tuple[float, float]:
-    """Return (calories_per_serving, protein_per_serving) for a dish.
-    Uses override if present. Else sums ingredients per serving."""
     md = dishes[dishes["dish_name"] == dish_name]
     if md.empty:
         return 0.0, 0.0
     row = md.iloc[0]
     if is_override_dish(row):
-        return float(row["cal_override"]), float(row["protein_override"])
-    # Sum ingredients
+        servings = get_dish_servings(row)
+        return float(row["cal_override"]) * servings, float(row["protein_override"]) * servings
+
     use = dings[dings["dish_name"] == dish_name]
     total_c = 0.0
     total_p = 0.0
     for _, ing in use.iterrows():
         frow = get_food_row(foods, ing["ingredient_food_name"], ing["ingredient_unit"])
         if frow is None:
-            continue  # missing ingredient definition, skip
+            continue
         qty = as_float(ing["ingredient_qty_per_serving"], 0.0)
         total_c += qty * as_float(frow["cal_per_unit"], 0.0)
         total_p += qty * as_float(frow["protein_per_unit"], 0.0)
-    yield_qty, _ = get_dish_yield(row)
-    if yield_qty > 0:
-        return total_c / yield_qty, total_p / yield_qty
     return total_c, total_p
+
+
+def get_auto_dish_yield(
+    dish_name: str, dings: pd.DataFrame
+) -> Tuple[float, str]:
+    use = dings[dings["dish_name"] == dish_name].copy()
+    if use.empty:
+        return 0.0, ""
+
+    use["ingredient_unit"] = use["ingredient_unit"].fillna("").astype(str).str.strip()
+    use["ingredient_qty_per_serving"] = pd.to_numeric(
+        use["ingredient_qty_per_serving"], errors="coerce"
+    )
+    use = use[
+        (use["ingredient_unit"] != "") & use["ingredient_qty_per_serving"].notna()
+    ]
+    if use.empty:
+        return 0.0, ""
+
+    units = use["ingredient_unit"].unique().tolist()
+    if len(units) != 1:
+        return 0.0, ""
+
+    return float(use["ingredient_qty_per_serving"].sum()), units[0]
+
+
+def get_effective_dish_yield(
+    dish_name: str, row, dings: pd.DataFrame
+) -> Tuple[float, str, str]:
+    manual_qty, manual_unit = get_dish_yield(row)
+    if manual_qty > 0 and manual_unit:
+        return manual_qty, manual_unit, "manual"
+
+    auto_qty, auto_unit = get_auto_dish_yield(dish_name, dings)
+    if auto_qty > 0 and auto_unit:
+        return auto_qty, auto_unit, "auto"
+
+    return 0.0, "", "none"
+
+
+def get_dish_metrics(
+    dish_name: str, dishes: pd.DataFrame, dings: pd.DataFrame, foods: pd.DataFrame
+):
+    md = dishes[dishes["dish_name"] == dish_name]
+    if md.empty:
+        return {
+            "servings": 1.0,
+            "total_calories": 0.0,
+            "total_protein": 0.0,
+            "per_serving_calories": 0.0,
+            "per_serving_protein": 0.0,
+            "final_qty": 0.0,
+            "final_unit": "",
+            "yield_source": "none",
+            "has_weight_basis": False,
+            "per_weight_calories": 0.0,
+            "per_weight_protein": 0.0,
+        }
+
+    row = md.iloc[0]
+    servings = get_dish_servings(row)
+    total_c, total_p = compute_dish_totals(dish_name, dishes, dings, foods)
+    final_qty, final_unit, yield_source = get_effective_dish_yield(dish_name, row, dings)
+    has_weight_basis = final_qty > 0 and bool(final_unit)
+
+    return {
+        "servings": servings,
+        "total_calories": total_c,
+        "total_protein": total_p,
+        "per_serving_calories": total_c / servings if servings > 0 else 0.0,
+        "per_serving_protein": total_p / servings if servings > 0 else 0.0,
+        "final_qty": final_qty,
+        "final_unit": final_unit,
+        "yield_source": yield_source,
+        "has_weight_basis": has_weight_basis,
+        "per_weight_calories": total_c / final_qty if has_weight_basis else 0.0,
+        "per_weight_protein": total_p / final_qty if has_weight_basis else 0.0,
+    }
+
+
+def get_dish_log_options(
+    dish_name: str, dishes: pd.DataFrame, dings: pd.DataFrame, foods: pd.DataFrame
+):
+    metrics = get_dish_metrics(dish_name, dishes, dings, foods)
+    options = [("serving", "Serving")]
+    if metrics["has_weight_basis"]:
+        source = "manual final weight" if metrics["yield_source"] == "manual" else "auto final weight"
+        options.append(
+            (
+                metrics["final_unit"],
+                f"Weight ({metrics['final_unit']}, {source})",
+            )
+        )
+    return options
+
+
+def get_dish_basis_label(log_unit: str) -> str:
+    return f"per {log_unit}"
+
+
+def compute_dish_base(
+    dish_name: str,
+    dishes: pd.DataFrame,
+    dings: pd.DataFrame,
+    foods: pd.DataFrame,
+    log_unit: str = "serving",
+) -> Tuple[float, float]:
+    metrics = get_dish_metrics(dish_name, dishes, dings, foods)
+    if log_unit == "serving":
+        return metrics["per_serving_calories"], metrics["per_serving_protein"]
+    if metrics["has_weight_basis"] and log_unit == metrics["final_unit"]:
+        return metrics["per_weight_calories"], metrics["per_weight_protein"]
+    return 0.0, 0.0
 
 
 def get_goal_for_date(goals: pd.DataFrame, day: date):
@@ -401,16 +499,34 @@ def recalc_logs_for_dishes(
     dish_names: list,
 ) -> pd.DataFrame:
     for dn in dish_names:
-        base_c, base_p = compute_dish_base(dn, dishes, dings, foods)
-        log_unit = get_dish_log_unit(dn, dishes)
-        mask = (
+        metrics = get_dish_metrics(dn, dishes, dings, foods)
+
+        serving_mask = (
             (logs["type"] == "dish")
             & (logs["name"] == dn)
-            & (logs["unit"] == log_unit)
+            & (logs["unit"] == "serving")
         )
-        qty = logs.loc[mask, "qty"].fillna(0).astype(float)
-        logs.loc[mask, "calories"] = qty * base_c
-        logs.loc[mask, "protein"] = qty * base_p
+        serving_qty = logs.loc[serving_mask, "qty"].fillna(0).astype(float)
+        logs.loc[serving_mask, "calories"] = (
+            serving_qty * metrics["per_serving_calories"]
+        )
+        logs.loc[serving_mask, "protein"] = (
+            serving_qty * metrics["per_serving_protein"]
+        )
+
+        if metrics["has_weight_basis"]:
+            weight_mask = (
+                (logs["type"] == "dish")
+                & (logs["name"] == dn)
+                & (logs["unit"] == metrics["final_unit"])
+            )
+            weight_qty = logs.loc[weight_mask, "qty"].fillna(0).astype(float)
+            logs.loc[weight_mask, "calories"] = (
+                weight_qty * metrics["per_weight_calories"]
+            )
+            logs.loc[weight_mask, "protein"] = (
+                weight_qty * metrics["per_weight_protein"]
+            )
     return logs
 
 
@@ -493,13 +609,48 @@ with tabs[0]:
             st.info("Add dishes in Master Data first.")
         else:
             d_name = st.selectbox("Dish", dish_names, key="log_dish_name")
-            base_c, base_p = compute_dish_base(d_name, dishes, dings, foods)
-            log_unit = get_dish_log_unit(d_name, dishes)
-            basis_label = get_dish_basis_label(d_name, dishes)
+            dish_metrics = get_dish_metrics(d_name, dishes, dings, foods)
+            log_options = get_dish_log_options(d_name, dishes, dings, foods)
+            option_labels = [label for _, label in log_options]
+            option_map = {label: unit for unit, label in log_options}
+            selected_label = st.selectbox("Log by", option_labels, key="log_dish_basis")
+            log_unit = option_map[selected_label]
+            base_c, base_p = compute_dish_base(d_name, dishes, dings, foods, log_unit)
+            basis_label = get_dish_basis_label(log_unit)
             est_c = qty * base_c
             est_p = qty * base_p
-            st.metric(f"Calories {basis_label}", f"{base_c:.1f}")
-            st.metric(f"Protein {basis_label} (g)", f"{base_p:.2f}")
+
+            info_cols = st.columns(2)
+            with info_cols[0]:
+                st.metric("Calories per serving", f"{dish_metrics['per_serving_calories']:.1f}")
+                st.metric("Protein per serving (g)", f"{dish_metrics['per_serving_protein']:.2f}")
+            with info_cols[1]:
+                if dish_metrics["has_weight_basis"]:
+                    source_label = (
+                        "Manual final weight"
+                        if dish_metrics["yield_source"] == "manual"
+                        else "Auto final weight"
+                    )
+                    st.metric(
+                        f"Calories per {dish_metrics['final_unit']}",
+                        f"{dish_metrics['per_weight_calories']:.2f}",
+                    )
+                    st.metric(
+                        f"Protein per {dish_metrics['final_unit']} (g)",
+                        f"{dish_metrics['per_weight_protein']:.3f}",
+                    )
+                    st.caption(
+                        f"{source_label}: {dish_metrics['final_qty']:.0f} {dish_metrics['final_unit']} total, "
+                        f"{dish_metrics['servings']:.0f} servings, "
+                        f"{dish_metrics['final_qty'] / dish_metrics['servings']:.1f} {dish_metrics['final_unit']} per serving."
+                    )
+                else:
+                    st.caption(
+                        "Weight logging becomes available when you add a manual final dish quantity or when all ingredient quantities share the same unit and can be auto-summed."
+                    )
+
+            st.metric(f"Calories {basis_label}", f"{base_c:.2f}")
+            st.metric(f"Protein {basis_label} (g)", f"{base_p:.3f}")
             st.metric("Calories (this entry)", f"{est_c:.0f}")
             st.metric("Protein (this entry, g)", f"{est_p:.1f}")
             if st.button(
@@ -995,10 +1146,11 @@ with tabs[3]:
         if save_dish:
             dname = dname.strip()
             yield_unit = yield_unit.strip()
-            if dname:
-                if not use_override and yield_qty > 0 and not yield_unit:
-                    st.error("Final dish unit is required when final dish quantity is set.")
-                    st.stop()
+            if not dname:
+                st.error("Dish name required.")
+            elif not use_override and yield_qty > 0 and not yield_unit:
+                st.error("Final dish unit is required when final dish quantity is set.")
+            else:
                 exists = dishes["dish_name"] == dname
                 calv = cal_o if use_override else None
                 protv = prot_o if use_override else None
@@ -1030,8 +1182,6 @@ with tabs[3]:
                 save_df(logs, LOGS_CSV)
                 st.success("Dish saved and logs recalculated.")
                 st.rerun()
-            else:
-                st.error("Dish name required.")
 
     section_heading(
         "Edit a dish",
@@ -1098,32 +1248,32 @@ with tabs[3]:
             edit_yield_unit = edit_yield_unit.strip()
             if not edit_use_override and edit_yield_qty > 0 and not edit_yield_unit:
                 st.error("Final dish unit is required when final dish quantity is set.")
-                st.stop()
-            yieldv = edit_yield_qty if not edit_use_override and edit_yield_qty > 0 else None
-            yield_unitv = edit_yield_unit if yieldv is not None else None
-            idx = drow.name
-            dishes.loc[
-                idx,
-                [
-                    "cal_override",
-                    "protein_override",
-                    "servings",
-                    "yield_qty",
-                    "yield_unit",
-                ],
-            ] = [
-                new_cal if edit_use_override else None,
-                new_prot if edit_use_override else None,
-                new_serv,
-                yieldv,
-                yield_unitv,
-            ]
-            save_df(dishes, DISHES_CSV)
-            # Recalculate all logs for this dish
-            logs = recalc_logs_for_dishes(logs, dishes, dings, foods, [dsel_edit])
-            save_df(logs, LOGS_CSV)
-            st.success(f"Dish {dsel_edit} updated and logs recalculated.")
-            st.rerun()
+            else:
+                yieldv = edit_yield_qty if not edit_use_override and edit_yield_qty > 0 else None
+                yield_unitv = edit_yield_unit if yieldv is not None else None
+                idx = drow.name
+                dishes.loc[
+                    idx,
+                    [
+                        "cal_override",
+                        "protein_override",
+                        "servings",
+                        "yield_qty",
+                        "yield_unit",
+                    ],
+                ] = [
+                    new_cal if edit_use_override else None,
+                    new_prot if edit_use_override else None,
+                    new_serv,
+                    yieldv,
+                    yield_unitv,
+                ]
+                save_df(dishes, DISHES_CSV)
+                # Recalculate all logs for this dish
+                logs = recalc_logs_for_dishes(logs, dishes, dings, foods, [dsel_edit])
+                save_df(logs, LOGS_CSV)
+                st.success(f"Dish {dsel_edit} updated and logs recalculated.")
+                st.rerun()
 
     with st.expander("Add ingredient to dish (for computed dishes)"):
         st.caption(
@@ -1250,24 +1400,33 @@ with tabs[3]:
 
     with st.expander("View dishes table", expanded=False):
         st.caption(
-            "Preview calculated dish nutrition and basis. Basis is per serving for overrides or per final unit, such as per g, when a cooked yield is set."
+            "Preview dish totals plus both logging bases. Final quantity is manual when entered, otherwise auto-summed from ingredients only when all ingredient quantities use the same unit."
         )
         if dishes.empty:
             st.info("No dishes yet.")
         else:
             preview = []
             for dname in sorted(dishes["dish_name"].tolist()):
-                base_c, base_p = compute_dish_base(dname, dishes, dings, foods)
-                drow = dishes[dishes["dish_name"] == dname].iloc[0]
-                yield_qty, yield_unit = get_dish_yield(drow)
+                metrics = get_dish_metrics(dname, dishes, dings, foods)
                 preview.append(
                     {
                         "dish_name": dname,
-                        "basis": get_dish_basis_label(dname, dishes),
-                        "final_qty": yield_qty if yield_qty > 0 else "",
-                        "final_unit": yield_unit,
-                        "calories": round(base_c, 2),
-                        "protein": round(base_p, 2),
+                        "servings": round(metrics["servings"], 2),
+                        "total_calories": round(metrics["total_calories"], 2),
+                        "total_protein": round(metrics["total_protein"], 2),
+                        "calories_per_serving": round(metrics["per_serving_calories"], 2),
+                        "protein_per_serving": round(metrics["per_serving_protein"], 2),
+                        "final_qty": round(metrics["final_qty"], 2)
+                        if metrics["has_weight_basis"]
+                        else None,
+                        "final_unit": metrics["final_unit"],
+                        "final_qty_source": metrics["yield_source"],
+                        "calories_per_final_unit": round(metrics["per_weight_calories"], 4)
+                        if metrics["has_weight_basis"]
+                        else None,
+                        "protein_per_final_unit": round(metrics["per_weight_protein"], 4)
+                        if metrics["has_weight_basis"]
+                        else None,
                     }
                 )
             st.dataframe(pd.DataFrame(preview), use_container_width=True)

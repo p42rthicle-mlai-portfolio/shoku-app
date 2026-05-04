@@ -556,11 +556,17 @@ def clear_session_keys(keys):
         st.session_state.pop(key, None)
 
 
-def initialize_batch_ingredient_rows(batch_dish_name: str, template_ings: pd.DataFrame):
+def initialize_batch_ingredient_rows(
+    batch_dish_name: str, template_ings: pd.DataFrame, force_reload: bool = False
+):
     row_state_key = f"create_batch_rows_{batch_dish_name}"
     row_seq_key = f"create_batch_row_seq_{batch_dish_name}"
-    if row_state_key in st.session_state:
+    if row_state_key in st.session_state and not force_reload:
         return row_state_key, row_seq_key
+
+    for key in list(st.session_state.keys()):
+        if key.startswith(f"{row_state_key}_"):
+            st.session_state.pop(key, None)
 
     rows = []
     next_row_id = 0
@@ -2057,9 +2063,12 @@ with tabs[3]:
             )
             template_row = dishes[dishes["dish_name"] == batch_dish_name].iloc[0]
             template_ings = dings[dings["dish_name"] == batch_dish_name].copy()
+            batch_loaded_key = "create_batch_loaded_template"
+            force_reload_template = st.session_state.get(batch_loaded_key) != batch_dish_name
             row_state_key, row_seq_key = initialize_batch_ingredient_rows(
-                batch_dish_name, template_ings
+                batch_dish_name, template_ings, force_reload=force_reload_template
             )
+            st.session_state[batch_loaded_key] = batch_dish_name
 
             c1, c2 = st.columns(2)
             with c1:

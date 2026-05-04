@@ -556,6 +556,64 @@ def clear_session_keys(keys):
         st.session_state.pop(key, None)
 
 
+def initialize_batch_ingredient_rows(batch_dish_name: str, template_ings: pd.DataFrame):
+    row_state_key = f"create_batch_rows_{batch_dish_name}"
+    row_seq_key = f"create_batch_row_seq_{batch_dish_name}"
+    if row_state_key in st.session_state:
+        return row_state_key, row_seq_key
+
+    rows = []
+    next_row_id = 0
+    for _, ing in template_ings.iterrows():
+        rows.append(
+            {
+                "row_id": next_row_id,
+                "ingredient_food_name": ing["ingredient_food_name"],
+                "ingredient_unit": ing["ingredient_unit"],
+                "ingredient_qty": float(ing["ingredient_qty_per_serving"]),
+            }
+        )
+        next_row_id += 1
+
+    st.session_state[row_state_key] = rows
+    st.session_state[row_seq_key] = next_row_id
+    return row_state_key, row_seq_key
+
+
+def add_batch_ingredient_row(batch_dish_name: str, foods: pd.DataFrame):
+    row_state_key = f"create_batch_rows_{batch_dish_name}"
+    row_seq_key = f"create_batch_row_seq_{batch_dish_name}"
+    rows = list(st.session_state.get(row_state_key, []))
+    next_row_id = int(st.session_state.get(row_seq_key, 0))
+
+    default_food = ""
+    default_unit = ""
+    if not foods.empty:
+        default_food = sorted(foods["food_name"].unique().tolist())[0]
+        food_units = sorted(
+            foods[foods["food_name"] == default_food]["unit"].dropna().astype(str).tolist()
+        )
+        if food_units:
+            default_unit = food_units[0]
+
+    rows.append(
+        {
+            "row_id": next_row_id,
+            "ingredient_food_name": default_food,
+            "ingredient_unit": default_unit,
+            "ingredient_qty": 0.0,
+        }
+    )
+    st.session_state[row_state_key] = rows
+    st.session_state[row_seq_key] = next_row_id + 1
+
+
+def remove_batch_ingredient_row(batch_dish_name: str, row_id: int):
+    row_state_key = f"create_batch_rows_{batch_dish_name}"
+    rows = list(st.session_state.get(row_state_key, []))
+    st.session_state[row_state_key] = [row for row in rows if row["row_id"] != row_id]
+
+
 def render_goal_progress(
     label: str, consumed: float, goal: float, good_when_under: bool
 ):
@@ -1999,6 +2057,9 @@ with tabs[3]:
             )
             template_row = dishes[dishes["dish_name"] == batch_dish_name].iloc[0]
             template_ings = dings[dings["dish_name"] == batch_dish_name].copy()
+            row_state_key, row_seq_key = initialize_batch_ingredient_rows(
+                batch_dish_name, template_ings
+            )
 
             c1, c2 = st.columns(2)
             with c1:
@@ -2042,44 +2103,112 @@ with tabs[3]:
                 st.info(
                     "This template uses manual override macros. The batch will snapshot total macros from the dish template and batch servings."
                 )
-            elif template_ings.empty:
-                st.warning("This dish has no ingredients yet.")
             else:
                 st.write("Ingredient snapshot for this batch")
-                for i, ing in template_ings.iterrows():
-                    qty_key = f"create_batch_qty_{batch_dish_name}_{i}"
-                    c1, c2, c3 = st.columns([4, 2, 2])
+                st.caption(
+                    "Change quantities, swap foods or units, remove template ingredients, and add batch-only ingredients before saving this snapshot."
+                )
+                remove_row_id = None
+                food_choices = sorted(foods["food_name"].unique().tolist())
+                current_rows = list(st.session_state.get(row_state_key, []))
+                if not current_rows:
+                    st.info("No ingredient rows yet. Add one below if this batch needs ingredients.")
+
+                for row in current_rows:
+                    row_id = row["row_id"]
+                    food_key_name = f"{row_state_key}_{row_id}_food"
+                    unit_key_name = f"{row_state_key}_{row_id}_unit"
+                    qty_key_name = f"{row_state_key}_{row_id}_qty"
+
+                    if food_key_name not in st.session_state:
+                        st.session_state[food_key_name] = row["ingredient_food_name"]
+                    if qty_key_name not in st.session_state:
+                        st.session_state[qty_key_name] = float(row["ingredient_qty"])
+
+                    selected_food = st.session_state.get(food_key_name, "")
+                    if selected_food not in food_choices and food_choices:
+                        selected_food = food_choices[0]
+                        st.session_state[food_key_name] = selected_food
+
+                    unit_choices = sorted(
+                        foods[foods["food_name"] == selected_food]["unit"]
+                        .dropna()
+                        .astype(str)
+                        .tolist()
+                    )
+                    if not unit_choices:
+                        unit_choices = [""]
+                    if (
+                        unit_key_name not in st.session_state
+                        or st.session_state[unit_key_name] not in unit_choices
+                    ):
+                        preferred_unit = row["ingredient_unit"]
+                        st.session_state[unit_key_name] = (
+                            preferred_unit if preferred_unit in unit_choices else unit_choices[0]
+                        )
+
+                    c1, c2, c3, c4, c5 = st.columns([3, 2, 2, 2, 1])
                     with c1:
-                        st.write(f"{ing['ingredient_food_name']} [{ing['ingredient_unit']}]")
+                        food_choice = st.selectbox(
+                            "Ingredient food",
+                            food_choices if food_choices else [""],
+                            index=(
+                                (food_choices if food_choices else [""]).index(selected_food)
+                                if selected_food in (food_choices if food_choices else [""])
+                                else 0
+                            ),
+                            key=food_key_name,
+                            label_visibility="collapsed",
+                        )
                     with c2:
+                        unit_choice = st.selectbox(
+                            "Ingredient unit",
+                            unit_choices,
+                            index=unit_choices.index(st.session_state[unit_key_name]),
+                            key=unit_key_name,
+                            label_visibility="collapsed",
+                        )
+                    with c3:
                         qty_value = st.number_input(
                             "Qty",
                             min_value=0.0,
                             step=1.0,
-                            value=float(ing["ingredient_qty_per_serving"]),
-                            key=qty_key,
+                            key=qty_key_name,
                             label_visibility="collapsed",
                         )
-                    with c3:
-                        frow = get_food_row(
-                            foods,
-                            ing["ingredient_food_name"],
-                            ing["ingredient_unit"],
-                        )
+                    with c4:
+                        frow = get_food_row(foods, food_choice, unit_choice)
                         if frow is None:
                             st.caption("Food missing")
                         else:
                             est_c = qty_value * as_float(frow["cal_per_unit"], 0.0)
                             est_p = qty_value * as_float(frow["protein_per_unit"], 0.0)
                             st.caption(f"{est_c:.0f} kcal | {est_p:.1f}g")
-                    if qty_value > 0:
+                    with c5:
+                        if st.button("Remove", key=f"{row_state_key}_{row_id}_remove"):
+                            remove_row_id = row_id
+
+                    row["ingredient_food_name"] = food_choice
+                    row["ingredient_unit"] = unit_choice
+                    row["ingredient_qty"] = qty_value
+                    if qty_value > 0 and food_choice and unit_choice:
                         batch_ingredient_rows.append(
                             {
-                                "ingredient_food_name": ing["ingredient_food_name"],
-                                "ingredient_unit": ing["ingredient_unit"],
+                                "ingredient_food_name": food_choice,
+                                "ingredient_unit": unit_choice,
                                 "ingredient_qty": qty_value,
                             }
                         )
+
+                st.session_state[row_state_key] = current_rows
+                add_col, _ = st.columns([1, 4])
+                with add_col:
+                    if st.button("Add ingredient row", key=f"{row_state_key}_add"):
+                        add_batch_ingredient_row(batch_dish_name, foods)
+                        st.rerun()
+                if remove_row_id is not None:
+                    remove_batch_ingredient_row(batch_dish_name, remove_row_id)
+                    st.rerun()
 
             preview_metrics = None
             if is_override_dish(template_row):

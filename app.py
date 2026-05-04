@@ -3,12 +3,15 @@
 
 import streamlit as st
 import pandas as pd
+import io
 from pathlib import Path
 from datetime import date, datetime, timedelta
 from typing import Tuple
 
 import shutil
 import os
+import tempfile
+import zipfile
 
 # --- 1. SECURITY LAYER ---
 def check_password():
@@ -34,22 +37,6 @@ def check_password():
 if not check_password():
     st.stop()
 
-
-# --- 2. BACKUP UTILITY ---
-st.sidebar.header("System Admin")
-if st.sidebar.button("Generate CSV Backup"):
-    # Creates a ZIP file of your entire 'data' folder
-    if os.path.exists("data"):
-        shutil.make_archive("backup_data", 'zip', "data")
-        with open("backup_data.zip", "rb") as f:
-            st.sidebar.download_button(
-                label="Download Backup ZIP",
-                data=f,
-                file_name="shoku_data_backup.zip",
-                mime="application/zip"
-            )
-    else:
-        st.sidebar.error("Data directory not found on server.")
 
 # --- YOUR EXISTING APP.PY CODE STARTS HERE ---
 # (Keep all your original logic below this line)
@@ -110,6 +97,17 @@ BATCH_INGREDIENT_COLUMNS = [
     "ingredient_qty",
 ]
 DATE_INPUT_FORMAT = "DD/MM/YYYY"
+REQUIRED_BACKUP_FILES = {
+    "foods.csv": FOOD_COLUMNS,
+    "dishes.csv": DISH_COLUMNS,
+    "dish_ingredients.csv": DISH_INGREDIENT_COLUMNS,
+    "goals.csv": GOAL_COLUMNS,
+    "logs.csv": LOG_COLUMNS,
+}
+OPTIONAL_BACKUP_FILES = {
+    "batches.csv": BATCH_COLUMNS,
+    "batch_ingredients.csv": BATCH_INGREDIENT_COLUMNS,
+}
 
 # ---------- Utilities ----------
 
@@ -184,6 +182,121 @@ def reset_all_data():
     reset_csv(LOGS_CSV, LOG_COLUMNS)
     reset_csv(BATCHES_CSV, BATCH_COLUMNS)
     reset_csv(BATCH_ING_CSV, BATCH_INGREDIENT_COLUMNS)
+
+
+def normalize_import_df(df: pd.DataFrame, columns: list) -> pd.DataFrame:
+    for column in columns:
+        if column not in df.columns:
+            df[column] = None
+    return df[columns]
+
+
+def get_backup_sources():
+    return {
+        "foods.csv": FOODS_CSV,
+        "dishes.csv": DISHES_CSV,
+        "dish_ingredients.csv": DISH_ING_CSV,
+        "goals.csv": GOALS_CSV,
+        "logs.csv": LOGS_CSV,
+        "batches.csv": BATCHES_CSV,
+        "batch_ingredients.csv": BATCH_ING_CSV,
+    }
+
+
+def build_backup_zip_bytes() -> bytes:
+    buffer = io.BytesIO()
+    with zipfile.ZipFile(buffer, "w", zipfile.ZIP_DEFLATED) as zf:
+        for filename, path in get_backup_sources().items():
+            if path.exists():
+                zf.writestr(filename, path.read_bytes())
+    return buffer.getvalue()
+
+
+def find_backup_member(extracted_dir: Path, filename: str) -> Path | None:
+    direct = extracted_dir / filename
+    nested = extracted_dir / "data" / filename
+    if direct.exists():
+        return direct
+    if nested.exists():
+        return nested
+    return None
+
+
+def import_backup_zip_bytes(zip_bytes: bytes):
+    try:
+        with zipfile.ZipFile(io.BytesIO(zip_bytes)) as zf:
+            members = [name for name in zf.namelist() if not name.endswith("/")]
+            required_names = set(REQUIRED_BACKUP_FILES.keys())
+            present_names = {Path(name).name for name in members}
+            missing = sorted(required_names - present_names)
+            if missing:
+                raise ValueError(
+                    "Backup is missing required files: " + ", ".join(missing)
+                )
+
+            with tempfile.TemporaryDirectory(prefix="shoku_import_") as tmp_dir:
+                extracted_dir = Path(tmp_dir)
+                zf.extractall(extracted_dir)
+
+                for filename, columns in REQUIRED_BACKUP_FILES.items():
+                    source = find_backup_member(extracted_dir, filename)
+                    if source is None:
+                        raise ValueError(f"Could not find {filename} in the backup ZIP.")
+                    imported_df = pd.read_csv(source)
+                    normalize_import_df(imported_df, columns).to_csv(
+                        get_backup_sources()[filename],
+                        index=False,
+                    )
+
+                for filename, columns in OPTIONAL_BACKUP_FILES.items():
+                    source = find_backup_member(extracted_dir, filename)
+                    if source is None:
+                        pd.DataFrame(columns=columns).to_csv(
+                            get_backup_sources()[filename],
+                            index=False,
+                        )
+                    else:
+                        imported_df = pd.read_csv(source)
+                        normalize_import_df(imported_df, columns).to_csv(
+                            get_backup_sources()[filename],
+                            index=False,
+                        )
+    except zipfile.BadZipFile as exc:
+        raise ValueError("Uploaded file is not a valid ZIP archive.") from exc
+
+
+# --- 2. BACKUP UTILITY ---
+st.sidebar.header("System Admin")
+st.sidebar.download_button(
+    label="Download CSV Backup",
+    data=build_backup_zip_bytes(),
+    file_name="shoku_data_backup.zip",
+    mime="application/zip",
+)
+backup_upload = st.sidebar.file_uploader(
+    "Import backup ZIP",
+    type=["zip"],
+    key="backup_import_zip",
+    help="Imports a backup ZIP and rewrites all app CSV data after confirmation.",
+)
+confirm_backup_import = st.sidebar.text_input(
+    "Type IMPORT BACKUP to confirm",
+    key="confirm_backup_import",
+)
+if st.sidebar.button("Import backup and replace data", key="import_backup_button"):
+    if backup_upload is None:
+        st.sidebar.error("Upload a backup ZIP first.")
+    elif confirm_backup_import.strip() != "IMPORT BACKUP":
+        st.sidebar.error("Confirmation did not match. Import was cancelled.")
+    else:
+        try:
+            import_backup_zip_bytes(backup_upload.getvalue())
+            st.session_state.pop("backup_import_zip", None)
+            st.session_state.pop("confirm_backup_import", None)
+            st.sidebar.success("Backup imported. Local CSV data was replaced.")
+            st.rerun()
+        except ValueError as exc:
+            st.sidebar.error(str(exc))
 
 
 def food_key(row) -> str:

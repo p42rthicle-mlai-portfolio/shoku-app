@@ -5,6 +5,7 @@ import streamlit as st
 import streamlit.components.v1 as components
 import pandas as pd
 import io
+import calendar
 from pathlib import Path
 from datetime import date, datetime, timedelta
 from typing import Tuple
@@ -348,6 +349,94 @@ def format_day(day_value) -> str:
 
 def format_date_series(values: pd.Series) -> pd.Series:
     return values.apply(format_day)
+
+
+def month_start(day_value: date) -> date:
+    return day_value.replace(day=1)
+
+
+def shift_month(day_value: date, delta_months: int) -> date:
+    year = day_value.year + ((day_value.month - 1 + delta_months) // 12)
+    month = ((day_value.month - 1 + delta_months) % 12) + 1
+    return date(year, month, 1)
+
+
+def calorie_status_for_day(calories, goal):
+    if pd.isna(calories) or pd.isna(goal):
+        return "#e5e7eb", "No goal"
+    calories = as_float(calories, 0.0)
+    goal = as_float(goal, 0.0)
+    if goal <= 0:
+        return "#e5e7eb", "No goal"
+    if calories <= goal * 1.04:
+        return "#2e7d32", f"{calories:.0f} / {goal:.0f} kcal"
+    return "#c62828", f"{calories:.0f} / {goal:.0f} kcal"
+
+
+def protein_status_for_day(protein, goal):
+    if pd.isna(protein) or pd.isna(goal):
+        return "#e5e7eb", "No goal"
+    protein = as_float(protein, 0.0)
+    goal = as_float(goal, 0.0)
+    if goal <= 0:
+        return "#e5e7eb", "No goal"
+    if protein >= goal:
+        return "#2e7d32", f"{protein:.1f} / {goal:.1f}g"
+    if protein >= goal * 0.9:
+        return "#9ca3af", f"{protein:.1f} / {goal:.1f}g"
+    return "#c62828", f"{protein:.1f} / {goal:.1f}g"
+
+
+def render_month_heatmap(title: str, month_value: date, values_by_day: dict, status_fn):
+    first_weekday, days_in_month = calendar.monthrange(month_value.year, month_value.month)
+    weekday_labels = ["Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"]
+    cells = []
+
+    for _ in range(first_weekday):
+        cells.append(
+            '<div style="height:72px;border:1px solid #f3f4f6;border-radius:6px;background:#fff;"></div>'
+        )
+
+    for day_num in range(1, days_in_month + 1):
+        stats = values_by_day.get(day_num)
+        if stats is None:
+            bg = "#f8fafc"
+            detail = "No log"
+            text_color = "#94a3b8"
+        else:
+            bg, detail = status_fn(stats["value"], stats["goal"])
+            text_color = "#111827" if bg not in {"#c62828", "#2e7d32"} else "#ffffff"
+        cells.append(
+            f"""
+            <div title="{detail}" style="
+                height:72px;
+                border-radius:6px;
+                padding:6px;
+                border:1px solid rgba(0,0,0,0.06);
+                background:{bg};
+                color:{text_color};
+                display:flex;
+                flex-direction:column;
+                justify-content:space-between;
+            ">
+                <div style="font-size:0.8rem;font-weight:700;">{day_num}</div>
+                <div style="font-size:0.72rem;line-height:1.2;">{detail}</div>
+            </div>
+            """
+        )
+
+    st.markdown(f"#### {title}")
+    st.markdown(
+        f"""
+        <div style="display:grid;grid-template-columns:repeat(7,minmax(0,1fr));gap:6px;margin-bottom:6px;">
+            {''.join(f'<div style="font-size:0.75rem;color:#6b7280;font-weight:700;text-align:center;">{label}</div>' for label in weekday_labels)}
+        </div>
+        <div style="display:grid;grid-template-columns:repeat(7,minmax(0,1fr));gap:6px;">
+            {''.join(cells)}
+        </div>
+        """,
+        unsafe_allow_html=True,
+    )
 
 
 def short_batch_id(batch_id: str) -> str:
@@ -1181,6 +1270,11 @@ with tabs[0]:
 
             st.metric(f"Calories {basis_label}", f"{base_c:.2f}")
             st.metric(f"Protein {basis_label} (g)", f"{base_p:.3f}")
+            if log_unit == "serving" and dish_metrics["has_weight_basis"]:
+                st.caption(
+                    f"1 serving = {dish_metrics['final_qty'] / dish_metrics['servings']:.1f} "
+                    f"{dish_metrics['final_unit']}"
+                )
             st.metric("Calories (this entry)", f"{est_c:.0f}")
             st.metric("Protein (this entry, g)", f"{est_p:.1f}")
             if st.button(
@@ -1253,6 +1347,11 @@ with tabs[0]:
 
             st.metric(f"Calories {basis_label}", f"{base_c:.2f}")
             st.metric(f"Protein {basis_label} (g)", f"{base_p:.3f}")
+            if log_unit == "serving" and batch_metrics["has_weight_basis"]:
+                st.caption(
+                    f"1 serving = {batch_metrics['final_qty'] / batch_metrics['servings']:.1f} "
+                    f"{batch_metrics['final_unit']}"
+                )
             st.metric("Calories (this entry)", f"{est_c:.0f}")
             st.metric("Protein (this entry, g)", f"{est_p:.1f}")
             if st.button(
@@ -1390,11 +1489,16 @@ with tabs[1]:
             axis=1,
         )
         # Show grouped by meal
-        for meal_name in ["Breakfast", "Lunch", "Dinner", "Snacks"]:
+        for meal_name in ["Breakfast", "Lunch", "Snacks", "Dinner"]:
             sub = day_logs[day_logs["meal"] == meal_name]
             if sub.empty:
                 continue
             st.markdown(f"### {meal_name}")
+            meal_calories = float(sub["calories"].sum())
+            meal_protein = float(sub["protein"].sum())
+            meal_m1, meal_m2 = st.columns(2)
+            meal_m1.metric("Meal calories", f"{meal_calories:.0f}")
+            meal_m2.metric("Meal protein (g)", f"{meal_protein:.1f}")
             # mandatory list with per-item breakdown
             show = sub[["type", "display_name", "unit", "qty", "calories", "protein"]].copy()
             show = show.rename(
@@ -1408,6 +1512,65 @@ with tabs[1]:
                 }
             )
             st.dataframe(show, hide_index=True, use_container_width=True)
+
+        st.markdown("### Edit an entry")
+        edit_options = {
+            log_entry_label(idx, row): idx for idx, row in day_logs.iterrows()
+        }
+        edit_label = st.selectbox(
+            "Select entry to edit",
+            list(edit_options.keys()),
+            key="edit_day_log_sel",
+        )
+        edit_idx = edit_options[edit_label]
+        edit_row = day_logs.loc[edit_idx]
+        if st.session_state.get("edit_day_log_loaded_idx") != edit_idx:
+            st.session_state.edit_day_log_qty = float(as_float(edit_row["qty"], 0.0))
+            st.session_state.edit_day_log_loaded_idx = edit_idx
+
+        new_qty = st.number_input(
+            "New quantity",
+            min_value=0.0,
+            step=1.0,
+            key="edit_day_log_qty",
+        )
+
+        preview_cal = 0.0
+        preview_prot = 0.0
+        if edit_row["type"] == "food":
+            frow = get_food_row(foods, edit_row["name"], edit_row["unit"])
+            if frow is not None:
+                preview_cal = new_qty * as_float(frow["cal_per_unit"], 0.0)
+                preview_prot = new_qty * as_float(frow["protein_per_unit"], 0.0)
+        elif edit_row["type"] == "dish":
+            base_c, base_p = compute_dish_base(
+                edit_row["name"], dishes, dings, foods, edit_row["unit"]
+            )
+            preview_cal = new_qty * base_c
+            preview_prot = new_qty * base_p
+        elif edit_row["type"] == "batch":
+            batch_row = get_batch_row(batches, as_text(edit_row.get("batch_id")))
+            base_c, base_p = compute_batch_base(batch_row, edit_row["unit"])
+            preview_cal = new_qty * base_c
+            preview_prot = new_qty * base_p
+
+        edit_m1, edit_m2 = st.columns(2)
+        edit_m1.metric("Updated calories", f"{preview_cal:.0f}")
+        edit_m2.metric("Updated protein (g)", f"{preview_prot:.1f}")
+
+        if st.button("Save quantity change", key="save_day_log_edit_button"):
+            if new_qty <= 0:
+                st.error("Quantity must be greater than 0.")
+            else:
+                logs.loc[edit_idx, "qty"] = new_qty
+                logs.loc[edit_idx, "calories"] = preview_cal
+                logs.loc[edit_idx, "protein"] = preview_prot
+                save_df(logs, LOGS_CSV)
+                clear_session_keys(
+                    ["edit_day_log_sel", "edit_day_log_qty", "edit_day_log_loaded_idx"]
+                )
+                st.success("Entry updated.")
+                st.rerun()
 
         st.markdown("### Delete an entry")
         delete_options = {
@@ -1435,41 +1598,115 @@ with tabs[1]:
 
 # --------- Tab 3: Dashboard ---------
 with tabs[2]:
-    st.subheader("Summary")
-    if logs.empty:
-        st.info("No data yet.")
+    st.subheader("Monthly Dashboard")
+    if "dashboard_month" not in st.session_state:
+        st.session_state.dashboard_month = month_start(date.today())
+
+    nav1, nav2, nav3 = st.columns([1, 3, 1])
+    with nav1:
+        if st.button("Previous month", key="dashboard_prev_month"):
+            st.session_state.dashboard_month = shift_month(
+                st.session_state.dashboard_month, -1
+            )
+            st.rerun()
+    with nav2:
+        st.markdown(
+            f"### {st.session_state.dashboard_month.strftime('%B %Y')}"
+        )
+    with nav3:
+        if st.button("Next month", key="dashboard_next_month"):
+            st.session_state.dashboard_month = shift_month(
+                st.session_state.dashboard_month, 1
+            )
+            st.rerun()
+
+    dashboard_month = st.session_state.dashboard_month
+    month_prefix = dashboard_month.strftime("%Y-%m")
+
+    agg = (
+        logs.groupby("date")
+        .agg(calories=("calories", "sum"), protein=("protein", "sum"))
+        .reset_index()
+        if not logs.empty
+        else pd.DataFrame(columns=["date", "calories", "protein"])
+    )
+    goals_join = goals.rename(columns={"date": "date"})
+    merged = pd.merge(agg, goals_join, on="date", how="outer").sort_values("date")
+    month_rows = merged[merged["date"].astype(str).str.startswith(month_prefix)].copy()
+
+    if month_rows.empty:
+        st.info("No logged entries or goals for this month yet.")
     else:
-        # Join logs with goals by date
-        agg = (
-            logs.groupby("date")
-            .agg(calories=("calories", "sum"), protein=("protein", "sum"))
-            .reset_index()
+        month_rows["calories"] = pd.to_numeric(month_rows["calories"], errors="coerce").fillna(0.0)
+        month_rows["protein"] = pd.to_numeric(month_rows["protein"], errors="coerce").fillna(0.0)
+        month_rows["calorie_goal"] = pd.to_numeric(
+            month_rows["calorie_goal"], errors="coerce"
         )
-        goals_join = goals.rename(columns={"date": "date"})
-        merged = pd.merge(agg, goals_join, on="date", how="left")
-        # Flags only apply to days that have both goals defined.
-        has_goals = merged["calorie_goal"].notna() & merged["protein_goal"].notna()
-        merged["protein_met"] = pd.NA
-        merged["under_cal"] = pd.NA
-        merged.loc[has_goals, "protein_met"] = (
-            merged.loc[has_goals, "protein"] >= merged.loc[has_goals, "protein_goal"]
+        month_rows["protein_goal"] = pd.to_numeric(
+            month_rows["protein_goal"], errors="coerce"
         )
-        merged.loc[has_goals, "under_cal"] = (
-            merged.loc[has_goals, "calories"] <= merged.loc[has_goals, "calorie_goal"]
-        )
-        # Counts
-        days_with_goals = merged.dropna(subset=["calorie_goal", "protein_goal"])
+        month_rows["has_log"] = (month_rows["calories"] > 0) | (month_rows["protein"] > 0)
+        month_rows["protein_met"] = (
+            month_rows["protein"] >= month_rows["protein_goal"]
+        ) & month_rows["protein_goal"].notna() & month_rows["has_log"]
+        month_rows["calorie_ok"] = (
+            month_rows["calories"] <= month_rows["calorie_goal"] * 1.04
+        ) & month_rows["calorie_goal"].notna() & month_rows["has_log"]
+
+        days_in_month = calendar.monthrange(
+            dashboard_month.year, dashboard_month.month
+        )[1]
+        protein_met_days = int(month_rows["protein_met"].sum())
+        calorie_ok_days = int(month_rows["calorie_ok"].sum())
+        logged_days = int(month_rows["has_log"].sum())
+
         c1, c2, c3 = st.columns(3)
-        c1.metric("Days logged", f"{len(agg)}")
-        c2.metric(
-            "Protein goal met (days)", f"{int(days_with_goals['protein_met'].sum())}"
+        c1.metric("Days logged", f"{logged_days}/{days_in_month}")
+        c2.metric("Protein met", f"{protein_met_days}/{days_in_month}")
+        c3.metric("Calories on target", f"{calorie_ok_days}/{days_in_month}")
+
+        calorie_map = {}
+        protein_map = {}
+        for _, row in month_rows.iterrows():
+            parsed_day = parse_date_value(row["date"])
+            if parsed_day is None or not row["has_log"]:
+                continue
+            calorie_map[parsed_day.day] = {
+                "value": row["calories"],
+                "goal": row["calorie_goal"],
+            }
+            protein_map[parsed_day.day] = {
+                "value": row["protein"],
+                "goal": row["protein_goal"],
+            }
+
+        heat1, heat2 = st.columns(2)
+        with heat1:
+            render_month_heatmap(
+                "Calories Heatmap", dashboard_month, calorie_map, calorie_status_for_day
+            )
+        with heat2:
+            render_month_heatmap(
+                "Protein Heatmap", dashboard_month, protein_map, protein_status_for_day
+            )
+
+        st.markdown("#### Month Detail")
+        month_rows["date"] = format_date_series(month_rows["date"])
+        st.dataframe(
+            month_rows[
+                [
+                    "date",
+                    "has_log",
+                    "calories",
+                    "calorie_goal",
+                    "calorie_ok",
+                    "protein",
+                    "protein_goal",
+                    "protein_met",
+                ]
+            ].fillna("—"),
+            use_container_width=True,
         )
-        c3.metric(
-            "Under calorie budget (days)", f"{int(days_with_goals['under_cal'].sum())}"
-        )
-        st.markdown("#### Per-day view")
-        merged["date"] = format_date_series(merged["date"])
-        st.dataframe(merged.fillna("—"), use_container_width=True)
 
 # --------- Tab 4: Master Data ---------
 with tabs[3]:

@@ -80,7 +80,18 @@ DISH_INGREDIENT_COLUMNS = [
     "ingredient_qty_per_serving",
 ]
 GOAL_COLUMNS = ["date", "calorie_goal", "protein_goal"]
-LOG_COLUMNS = ["date", "meal", "type", "name", "batch_id", "unit", "qty", "calories", "protein"]
+LOG_COLUMNS = [
+    "date",
+    "meal",
+    "type",
+    "name",
+    "batch_id",
+    "unit",
+    "qty",
+    "calories",
+    "protein",
+    "checked",
+]
 BATCH_COLUMNS = [
     "batch_id",
     "dish_name",
@@ -156,6 +167,8 @@ def load_all():
     for col in ["qty", "calories", "protein"]:
         if col in logs.columns:
             logs[col] = pd.to_numeric(logs[col], errors="coerce")
+    if "checked" in logs.columns:
+        logs["checked"] = to_bool_series(logs["checked"])
     for col in ["servings", "final_qty", "total_calories", "total_protein"]:
         if col in batches.columns:
             batches[col] = pd.to_numeric(batches[col], errors="coerce")
@@ -167,6 +180,16 @@ def load_all():
 
 def save_df(df: pd.DataFrame, path: Path):
     df.to_csv(path, index=False)
+
+
+def to_bool_series(values: pd.Series) -> pd.Series:
+    return (
+        values.fillna(False)
+        .astype(str)
+        .str.strip()
+        .str.lower()
+        .isin(["true", "1", "yes", "y"])
+    )
 
 
 def empty_df(columns: list) -> pd.DataFrame:
@@ -388,54 +411,91 @@ def protein_status_for_day(protein, goal):
 
 
 def render_month_heatmap(title: str, month_value: date, values_by_day: dict, status_fn):
-    first_weekday, days_in_month = calendar.monthrange(month_value.year, month_value.month)
-    weekday_labels = ["Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"]
-    cells = []
+    weeks = calendar.monthcalendar(month_value.year, month_value.month)
+    weekday_labels = ["M", "T", "W", "T", "F", "S", "S"]
 
-    for _ in range(first_weekday):
-        cells.append(
-            '<div style="height:72px;border:1px solid #f3f4f6;border-radius:6px;background:#fff;"></div>'
+    columns_html = []
+    for week in weeks:
+        week_cells = []
+        for weekday_index, day_num in enumerate(week):
+            if day_num == 0:
+                week_cells.append(
+                    '<div style="width:12px;height:12px;border-radius:2px;background:transparent;"></div>'
+                )
+                continue
+
+            stats = values_by_day.get(day_num)
+            if stats is None:
+                bg = "#ebedf0"
+                detail = "No log"
+            else:
+                bg, detail = status_fn(stats["value"], stats["goal"])
+
+            week_cells.append(
+                f"""
+                <div
+                    title="{month_value.strftime('%B')} {day_num}: {detail}"
+                    aria-label="{title} {month_value.strftime('%B')} {day_num}: {detail}"
+                    style="
+                        width:12px;
+                        height:12px;
+                        border-radius:2px;
+                        background:{bg};
+                        border:1px solid rgba(27,31,35,0.06);
+                        box-sizing:border-box;
+                    "
+                ></div>
+                """
+            )
+
+        first_day = next((day_num for day_num in week if day_num != 0), 0)
+        week_label = (
+            f"{first_day}"
+            if first_day
+            else ""
         )
-
-    for day_num in range(1, days_in_month + 1):
-        stats = values_by_day.get(day_num)
-        if stats is None:
-            bg = "#f8fafc"
-            detail = "No log"
-            text_color = "#94a3b8"
-        else:
-            bg, detail = status_fn(stats["value"], stats["goal"])
-            text_color = "#111827" if bg not in {"#c62828", "#2e7d32"} else "#ffffff"
-        cells.append(
+        columns_html.append(
             f"""
-            <div title="{detail}" style="
-                height:72px;
-                border-radius:6px;
-                padding:6px;
-                border:1px solid rgba(0,0,0,0.06);
-                background:{bg};
-                color:{text_color};
-                display:flex;
-                flex-direction:column;
-                justify-content:space-between;
-            ">
-                <div style="font-size:0.8rem;font-weight:700;">{day_num}</div>
-                <div style="font-size:0.72rem;line-height:1.2;">{detail}</div>
+            <div style="display:flex;flex-direction:column;gap:4px;align-items:center;">
+                <div style="height:12px;line-height:12px;font-size:0.62rem;color:#6b7280;white-space:nowrap;">
+                    {week_label}
+                </div>
+                {''.join(week_cells)}
             </div>
             """
         )
 
+    label_cells = []
+    for weekday_label in weekday_labels:
+        label_cells.append(
+            f'<div style="height:12px;line-height:12px;font-size:0.65rem;color:#6b7280;">{weekday_label}</div>'
+        )
+
     st.markdown(f"#### {title}")
-    st.markdown(
+    components.html(
         f"""
-        <div style="display:grid;grid-template-columns:repeat(7,minmax(0,1fr));gap:6px;margin-bottom:6px;">
-            {''.join(f'<div style="font-size:0.75rem;color:#6b7280;font-weight:700;text-align:center;">{label}</div>' for label in weekday_labels)}
+        <div style="font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif; color:#111827;">
+            <div style="display:flex;align-items:flex-start;gap:8px;margin-bottom:8px;">
+                <div style="display:flex;flex-direction:column;gap:4px;padding-top:16px;min-width:24px;">
+                    {''.join(label_cells)}
+                </div>
+                <div style="display:flex;gap:4px;">
+                    {''.join(columns_html)}
+                </div>
+            </div>
+        <div style="display:flex;gap:8px;align-items:center;font-size:0.72rem;color:#6b7280;">
+            <span>Worse</span>
+            <div style="display:flex;gap:4px;align-items:center;">
+                <div style="width:10px;height:10px;border-radius:2px;background:#c62828;border:1px solid rgba(27,31,35,0.06);"></div>
+                <div style="width:10px;height:10px;border-radius:2px;background:#9ca3af;border:1px solid rgba(27,31,35,0.06);"></div>
+                <div style="width:10px;height:10px;border-radius:2px;background:#2e7d32;border:1px solid rgba(27,31,35,0.06);"></div>
+                <div style="width:10px;height:10px;border-radius:2px;background:#ebedf0;border:1px solid rgba(27,31,35,0.06);"></div>
+            </div>
+            <span>Better</span>
         </div>
-        <div style="display:grid;grid-template-columns:repeat(7,minmax(0,1fr));gap:6px;">
-            {''.join(cells)}
         </div>
         """,
-        unsafe_allow_html=True,
+        height=190,
     )
 
 
@@ -980,6 +1040,7 @@ def add_log_entry(
         qty,
         cal,
         prot,
+        False,
     ]
     return logs
 
@@ -1482,6 +1543,7 @@ with tabs[1]:
     if day_logs.empty:
         st.info("No entries for this date.")
     else:
+        day_logs["checked"] = to_bool_series(day_logs["checked"])
         day_logs["display_name"] = day_logs["name"]
         batch_mask = (day_logs["type"] == "batch") & day_logs["batch_id"].notna()
         day_logs.loc[batch_mask, "display_name"] = day_logs.loc[batch_mask].apply(
@@ -1499,19 +1561,44 @@ with tabs[1]:
             meal_m1, meal_m2 = st.columns(2)
             meal_m1.metric("Meal calories", f"{meal_calories:.0f}")
             meal_m2.metric("Meal protein (g)", f"{meal_protein:.1f}")
-            # mandatory list with per-item breakdown
-            show = sub[["type", "display_name", "unit", "qty", "calories", "protein"]].copy()
-            show = show.rename(
-                columns={
-                    "type": "Type",
-                    "display_name": "Item",
-                    "unit": "Unit",
-                    "qty": "Qty",
-                    "calories": "Calories",
-                    "protein": "Protein (g)",
-                }
-            )
-            st.dataframe(show, hide_index=True, use_container_width=True)
+            with st.container(border=True):
+                header_cols = st.columns([0.5, 1.1, 3.2, 1, 1, 1.2, 1.2])
+                header_labels = ["", "Type", "Item", "Unit", "Qty", "Calories", "Protein (g)"]
+                for col, label in zip(header_cols, header_labels):
+                    col.markdown(
+                        f"<div style='font-size:0.78rem;color:#666;font-weight:700;'>{label}</div>",
+                        unsafe_allow_html=True,
+                    )
+                st.markdown(
+                    "<div style='border-top:1px solid rgba(49,51,63,0.2); margin:0.25rem 0 0.35rem 0;'></div>",
+                    unsafe_allow_html=True,
+                )
+
+                for row_pos, (idx, row) in enumerate(sub.iterrows()):
+                    row_cols = st.columns([0.5, 1.1, 3.2, 1, 1, 1.2, 1.2])
+                    checkbox_key = f"day_view_done_{view_date.isoformat()}_{idx}"
+                    if checkbox_key not in st.session_state:
+                        st.session_state[checkbox_key] = bool(row["checked"])
+                    checked_value = row_cols[0].checkbox(
+                        "Done",
+                        key=checkbox_key,
+                        label_visibility="collapsed",
+                    )
+                    if bool(row["checked"]) != bool(checked_value):
+                        logs.loc[idx, "checked"] = bool(checked_value)
+                        day_logs.loc[idx, "checked"] = bool(checked_value)
+                        save_df(logs, LOGS_CSV)
+                    row_cols[1].write(as_text(row["type"]))
+                    row_cols[2].write(as_text(row["display_name"]))
+                    row_cols[3].write(as_text(row["unit"]))
+                    row_cols[4].write(f"{as_float(row['qty'], 0.0):g}")
+                    row_cols[5].write(f"{as_float(row['calories'], 0.0):.0f}")
+                    row_cols[6].write(f"{as_float(row['protein'], 0.0):.1f}")
+                    if row_pos < len(sub.index) - 1:
+                        st.markdown(
+                            "<div style='border-top:1px solid rgba(49,51,63,0.12); margin:0.15rem 0 0.35rem 0;'></div>",
+                            unsafe_allow_html=True,
+                        )
 
         st.markdown("### Edit an entry")
         edit_options = {

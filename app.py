@@ -81,6 +81,7 @@ DISH_INGREDIENT_COLUMNS = [
 ]
 GOAL_COLUMNS = ["date", "calorie_goal", "protein_goal"]
 LOG_COLUMNS = [
+    "log_id",
     "date",
     "meal",
     "type",
@@ -167,6 +168,7 @@ def load_all():
     for col in ["qty", "calories", "protein"]:
         if col in logs.columns:
             logs[col] = pd.to_numeric(logs[col], errors="coerce")
+    logs = ensure_log_ids(logs)
     if "checked" in logs.columns:
         logs["checked"] = to_bool_series(logs["checked"])
     for col in ["servings", "final_qty", "total_calories", "total_protein"]:
@@ -190,6 +192,32 @@ def to_bool_series(values: pd.Series) -> pd.Series:
         .str.lower()
         .isin(["true", "1", "yes", "y"])
     )
+
+
+def make_log_id(log_day: date) -> str:
+    return f"log_{log_day.strftime('%Y%m%d')}_{datetime.now().strftime('%H%M%S%f')}"
+
+
+def ensure_log_ids(logs: pd.DataFrame) -> pd.DataFrame:
+    if "log_id" not in logs.columns:
+        logs["log_id"] = None
+
+    seen_ids = set()
+    updates_made = False
+    for idx in logs.index:
+        current_id = as_text(logs.at[idx, "log_id"])
+        if not current_id or current_id in seen_ids:
+            log_day = parse_date_value(logs.at[idx, "date"]) or date.today()
+            current_id = make_log_id(log_day)
+            while current_id in seen_ids:
+                current_id = make_log_id(log_day)
+            logs.at[idx, "log_id"] = current_id
+            updates_made = True
+        seen_ids.add(current_id)
+
+    if updates_made:
+        save_df(logs, LOGS_CSV)
+    return logs
 
 
 def empty_df(columns: list) -> pd.DataFrame:
@@ -649,6 +677,10 @@ def clear_add_dish_form():
     )
 
 
+def clear_duplicate_dish_form():
+    clear_session_keys(["duplicate_dish_source", "duplicate_dish_name"])
+
+
 def clear_create_batch_form():
     for key in list(st.session_state.keys()):
         if key.startswith("create_batch_"):
@@ -688,15 +720,17 @@ def set_view_date_today():
     st.session_state.view_date = date.today()
 
 
-def log_entry_label(idx, row) -> str:
+def log_entry_label(row) -> str:
     item_name = row["name"]
     if row.get("type") == "batch" and as_text(row.get("batch_id")):
         item_name = f"{item_name} [{short_batch_id(row.get('batch_id'))}]"
+    short_log_id = as_text(row.get("log_id"))[-6:]
     return (
-        f"{idx}: {row['meal']} - {row['type']} - {item_name} "
+        f"{row['meal']} - {row['type']} - {item_name} "
         f"({as_float(row['qty'], 0.0):g} {row['unit']}, "
         f"{as_float(row['calories'], 0.0):.0f} kcal, "
         f"{as_float(row['protein'], 0.0):.1f}g protein)"
+        f" [{short_log_id}]"
     )
 
 
@@ -998,6 +1032,49 @@ def compute_batch_base(batch_row, log_unit: str = "serving") -> Tuple[float, flo
     return 0.0, 0.0
 
 
+def get_batch_consumption_summary(logs: pd.DataFrame, batch_row) -> dict:
+    metrics = get_batch_metrics(batch_row)
+    batch_id = as_text(batch_row.get("batch_id")) if batch_row is not None else ""
+    final_unit = metrics["final_unit"]
+    consumed_servings = 0.0
+    consumed_weight = 0.0
+
+    if batch_id:
+        batch_logs = logs[
+            (logs["type"] == "batch") & (logs["batch_id"] == batch_id)
+        ].copy()
+        for _, row in batch_logs.iterrows():
+            qty = as_float(row.get("qty"), 0.0)
+            unit = as_text(row.get("unit"))
+            if qty <= 0:
+                continue
+            if unit == "serving":
+                consumed_servings += qty
+                if metrics["has_weight_basis"] and metrics["servings"] > 0:
+                    consumed_weight += qty * metrics["final_qty"] / metrics["servings"]
+            elif metrics["has_weight_basis"] and unit == final_unit:
+                consumed_weight += qty
+                if metrics["final_qty"] > 0:
+                    consumed_servings += qty * metrics["servings"] / metrics["final_qty"]
+
+    return {
+        "consumed_servings": consumed_servings,
+        "remaining_servings": max(metrics["servings"] - consumed_servings, 0.0),
+        "consumed_weight": consumed_weight,
+        "remaining_weight": (
+            max(metrics["final_qty"] - consumed_weight, 0.0)
+            if metrics["has_weight_basis"]
+            else 0.0
+        ),
+        "over_servings": max(consumed_servings - metrics["servings"], 0.0),
+        "over_weight": (
+            max(consumed_weight - metrics["final_qty"], 0.0)
+            if metrics["has_weight_basis"]
+            else 0.0
+        ),
+    }
+
+
 def get_goal_for_date(goals: pd.DataFrame, day: date):
     s = goals[goals["date"] == day.isoformat()]
     if s.empty:
@@ -1031,6 +1108,7 @@ def add_log_entry(
     batch_id: str = "",
 ) -> pd.DataFrame:
     logs.loc[len(logs)] = [
+        make_log_id(day),
         day.isoformat(),
         meal,
         typ,
@@ -1367,6 +1445,7 @@ with tabs[0]:
             batch_id = dict(batch_options)[selected_batch_label]
             batch_row = get_batch_row(batches, batch_id)
             batch_metrics = get_batch_metrics(batch_row)
+            batch_consumption = get_batch_consumption_summary(logs, batch_row)
             log_options = get_batch_log_options(batch_row)
             option_labels = [label for _, label in log_options]
             option_map = {label: unit for unit, label in log_options}
@@ -1404,6 +1483,41 @@ with tabs[0]:
                 else:
                     st.caption(
                         "This batch only supports serving-based logging because no final weight was saved."
+                    )
+
+            remaining_cols = st.columns(2)
+            if batch_metrics["has_weight_basis"]:
+                remaining_cols[0].metric(
+                    f"Remaining {batch_metrics['final_unit']}",
+                    f"{batch_consumption['remaining_weight']:.1f}",
+                )
+                remaining_cols[1].metric(
+                    "Remaining servings",
+                    f"{batch_consumption['remaining_servings']:.2f}",
+                )
+                if batch_consumption["over_weight"] > 0:
+                    st.caption(
+                        f"Logged amount is over the saved batch total by "
+                        f"{batch_consumption['over_weight']:.1f} {batch_metrics['final_unit']}."
+                    )
+                else:
+                    st.caption(
+                        f"Logged so far: {batch_consumption['consumed_weight']:.1f} {batch_metrics['final_unit']} "
+                        f"across {batch_consumption['consumed_servings']:.2f} servings."
+                    )
+            else:
+                remaining_cols[0].metric(
+                    "Remaining servings",
+                    f"{batch_consumption['remaining_servings']:.2f}",
+                )
+                remaining_cols[1].metric(
+                    "Logged servings",
+                    f"{batch_consumption['consumed_servings']:.2f}",
+                )
+                if batch_consumption["over_servings"] > 0:
+                    st.caption(
+                        f"Logged amount is over the saved batch total by "
+                        f"{batch_consumption['over_servings']:.2f} servings."
                     )
 
             st.metric(f"Calories {basis_label}", f"{base_c:.2f}")
@@ -1576,7 +1690,8 @@ with tabs[1]:
 
                 for row_pos, (idx, row) in enumerate(sub.iterrows()):
                     row_cols = st.columns([0.5, 1.1, 3.2, 1, 1, 1.2, 1.2])
-                    checkbox_key = f"day_view_done_{view_date.isoformat()}_{idx}"
+                    log_id = as_text(row.get("log_id"))
+                    checkbox_key = f"day_view_done_{log_id}"
                     if checkbox_key not in st.session_state:
                         st.session_state[checkbox_key] = bool(row["checked"])
                     checked_value = row_cols[0].checkbox(
@@ -1585,7 +1700,8 @@ with tabs[1]:
                         label_visibility="collapsed",
                     )
                     if bool(row["checked"]) != bool(checked_value):
-                        logs.loc[idx, "checked"] = bool(checked_value)
+                        log_mask = logs["log_id"] == log_id
+                        logs.loc[log_mask, "checked"] = bool(checked_value)
                         day_logs.loc[idx, "checked"] = bool(checked_value)
                         save_df(logs, LOGS_CSV)
                     row_cols[1].write(as_text(row["type"]))
@@ -1602,18 +1718,20 @@ with tabs[1]:
 
         st.markdown("### Edit an entry")
         edit_options = {
-            log_entry_label(idx, row): idx for idx, row in day_logs.iterrows()
+            log_entry_label(row): as_text(row["log_id"]) for _, row in day_logs.iterrows()
         }
         edit_label = st.selectbox(
             "Select entry to edit",
             list(edit_options.keys()),
             key="edit_day_log_sel",
         )
-        edit_idx = edit_options[edit_label]
-        edit_row = day_logs.loc[edit_idx]
-        if st.session_state.get("edit_day_log_loaded_idx") != edit_idx:
+        edit_log_id = edit_options[edit_label]
+        edit_match = day_logs[day_logs["log_id"] == edit_log_id]
+        edit_idx = edit_match.index[0]
+        edit_row = edit_match.iloc[0]
+        if st.session_state.get("edit_day_log_loaded_id") != edit_log_id:
             st.session_state.edit_day_log_qty = float(as_float(edit_row["qty"], 0.0))
-            st.session_state.edit_day_log_loaded_idx = edit_idx
+            st.session_state.edit_day_log_loaded_id = edit_log_id
 
         new_qty = st.number_input(
             "New quantity",
@@ -1649,19 +1767,20 @@ with tabs[1]:
             if new_qty <= 0:
                 st.error("Quantity must be greater than 0.")
             else:
-                logs.loc[edit_idx, "qty"] = new_qty
-                logs.loc[edit_idx, "calories"] = preview_cal
-                logs.loc[edit_idx, "protein"] = preview_prot
+                edit_mask = logs["log_id"] == edit_log_id
+                logs.loc[edit_mask, "qty"] = new_qty
+                logs.loc[edit_mask, "calories"] = preview_cal
+                logs.loc[edit_mask, "protein"] = preview_prot
                 save_df(logs, LOGS_CSV)
                 clear_session_keys(
-                    ["edit_day_log_sel", "edit_day_log_qty", "edit_day_log_loaded_idx"]
+                    ["edit_day_log_sel", "edit_day_log_qty", "edit_day_log_loaded_id"]
                 )
                 st.success("Entry updated.")
                 st.rerun()
 
         st.markdown("### Delete an entry")
         delete_options = {
-            log_entry_label(idx, row): idx for idx, row in day_logs.iterrows()
+            log_entry_label(row): as_text(row["log_id"]) for _, row in day_logs.iterrows()
         }
         delete_label = st.selectbox(
             "Select entry to delete",
@@ -1674,8 +1793,8 @@ with tabs[1]:
         )
         if st.button("Delete selected entry", key="delete_day_log_button"):
             if confirm_delete_entry.strip() == "DELETE ENTRY":
-                delete_idx = delete_options[delete_label]
-                logs = logs.drop(delete_idx)
+                delete_log_id = delete_options[delete_label]
+                logs = logs[logs["log_id"] != delete_log_id].copy()
                 save_df(logs, LOGS_CSV)
                 clear_session_keys(["delete_day_log_sel", "confirm_delete_day_log"])
                 st.success("Entry deleted.")
@@ -2141,6 +2260,67 @@ with tabs[3]:
                 clear_add_dish_form()
                 st.session_state.master_data_message = "Dish saved and logs recalculated."
                 st.rerun()
+
+    section_heading(
+        "Duplicate a dish",
+        "Copy a dish template and its ingredient rows into a new dish name. Useful when two recipes are mostly the same and you just want to tweak the copy.",
+    )
+    if not dishes.empty:
+        with st.expander("Duplicate a dish", expanded=False):
+            duplicate_source = st.selectbox(
+                "Dish to duplicate",
+                sorted(dishes["dish_name"].tolist()),
+                key="duplicate_dish_source",
+            )
+            duplicate_name = st.text_input(
+                "New dish name",
+                key="duplicate_dish_name",
+                help="The copy will include the dish settings and all template ingredients.",
+            )
+            dup_col1, dup_col2 = st.columns(2)
+            with dup_col1:
+                duplicate_dish = st.button("Duplicate dish", key="duplicate_dish_button")
+            with dup_col2:
+                st.button(
+                    "Clear form",
+                    key="clear_duplicate_dish",
+                    on_click=clear_duplicate_dish_form,
+                )
+
+            if duplicate_dish:
+                duplicate_name = duplicate_name.strip()
+                if not duplicate_name:
+                    st.error("New dish name required.")
+                elif duplicate_name == duplicate_source:
+                    st.error("New dish name must be different from the original.")
+                elif (dishes["dish_name"] == duplicate_name).any():
+                    st.error("A dish with that name already exists.")
+                else:
+                    source_row = dishes[dishes["dish_name"] == duplicate_source].iloc[0]
+                    new_dish_row = source_row.copy()
+                    new_dish_row["dish_name"] = duplicate_name
+                    dishes = pd.concat(
+                        [dishes, pd.DataFrame([new_dish_row])[DISH_COLUMNS]],
+                        ignore_index=True,
+                    )
+
+                    source_ings = dings[dings["dish_name"] == duplicate_source].copy()
+                    if not source_ings.empty:
+                        source_ings["dish_name"] = duplicate_name
+                        dings = pd.concat(
+                            [dings, source_ings[DISH_INGREDIENT_COLUMNS]],
+                            ignore_index=True,
+                        )
+
+                    save_df(dishes, DISHES_CSV)
+                    save_df(dings, DISH_ING_CSV)
+                    clear_duplicate_dish_form()
+                    ing_count = len(source_ings)
+                    st.session_state.master_data_message = (
+                        f"Duplicated {duplicate_source} to {duplicate_name} "
+                        f"with {ing_count} ingredient row{'s' if ing_count != 1 else ''}."
+                    )
+                    st.rerun()
 
     section_heading(
         "Edit a dish",

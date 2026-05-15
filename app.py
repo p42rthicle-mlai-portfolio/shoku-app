@@ -112,6 +112,7 @@ BATCH_INGREDIENT_COLUMNS = [
     "ingredient_qty",
 ]
 DATE_INPUT_FORMAT = "DD/MM/YYYY"
+MEAL_OPTIONS = ["Breakfast", "Lunch", "Snacks", "Dinner"]
 REQUIRED_BACKUP_FILES = {
     "foods.csv": FOOD_COLUMNS,
     "dishes.csv": DISH_COLUMNS,
@@ -1318,9 +1319,7 @@ with tabs[0]:
             format=DATE_INPUT_FORMAT,
             key="log_date",
         )
-        meal = st.selectbox(
-            "Meal", ["Breakfast", "Lunch", "Dinner", "Snacks"], index=0, key="log_meal"
-        )
+        meal = st.selectbox("Meal", MEAL_OPTIONS, index=0, key="log_meal")
         entry_type = st.radio("Type", ["Food", "Dish", "Batch"], horizontal=True, key="log_type")
     with c2:
         qty = st.number_input(
@@ -1665,7 +1664,7 @@ with tabs[1]:
             axis=1,
         )
         # Show grouped by meal
-        for meal_name in ["Breakfast", "Lunch", "Snacks", "Dinner"]:
+        for meal_name in MEAL_OPTIONS:
             sub = day_logs[day_logs["meal"] == meal_name]
             if sub.empty:
                 continue
@@ -1731,8 +1730,13 @@ with tabs[1]:
         edit_row = edit_match.iloc[0]
         if st.session_state.get("edit_day_log_loaded_id") != edit_log_id:
             st.session_state.edit_day_log_qty = float(as_float(edit_row["qty"], 0.0))
+            current_meal = as_text(edit_row["meal"])
+            st.session_state.edit_day_log_meal = (
+                current_meal if current_meal in MEAL_OPTIONS else MEAL_OPTIONS[0]
+            )
             st.session_state.edit_day_log_loaded_id = edit_log_id
 
+        new_meal = st.selectbox("Meal", MEAL_OPTIONS, key="edit_day_log_meal")
         new_qty = st.number_input(
             "New quantity",
             min_value=0.0,
@@ -1763,17 +1767,23 @@ with tabs[1]:
         edit_m1.metric("Updated calories", f"{preview_cal:.0f}")
         edit_m2.metric("Updated protein (g)", f"{preview_prot:.1f}")
 
-        if st.button("Save quantity change", key="save_day_log_edit_button"):
+        if st.button("Save entry changes", key="save_day_log_edit_button"):
             if new_qty <= 0:
                 st.error("Quantity must be greater than 0.")
             else:
                 edit_mask = logs["log_id"] == edit_log_id
+                logs.loc[edit_mask, "meal"] = new_meal
                 logs.loc[edit_mask, "qty"] = new_qty
                 logs.loc[edit_mask, "calories"] = preview_cal
                 logs.loc[edit_mask, "protein"] = preview_prot
                 save_df(logs, LOGS_CSV)
                 clear_session_keys(
-                    ["edit_day_log_sel", "edit_day_log_qty", "edit_day_log_loaded_id"]
+                    [
+                        "edit_day_log_sel",
+                        "edit_day_log_meal",
+                        "edit_day_log_qty",
+                        "edit_day_log_loaded_id",
+                    ]
                 )
                 st.success("Entry updated.")
                 st.rerun()

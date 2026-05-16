@@ -1925,6 +1925,9 @@ with tabs[2]:
             mavg1.metric("Calories", f"{month_avg_calories:.0f}")
             mavg2.metric("Protein (g)", f"{month_avg_protein:.1f}")
             st.caption(
+                f"Totals used: {month_total_calories:.0f} kcal and {month_total_protein:.1f}g protein. "
+            )
+            st.caption(
                 f"Using {month_days_elapsed} elapsed day{'s' if month_days_elapsed != 1 else ''} "
                 f"through {format_day(dashboard_anchor_day)}."
             )
@@ -1933,6 +1936,9 @@ with tabs[2]:
             wavg1, wavg2 = st.columns(2)
             wavg1.metric("Calories", f"{week_avg_calories:.0f}")
             wavg2.metric("Protein (g)", f"{week_avg_protein:.1f}")
+            st.caption(
+                f"Totals used: {week_total_calories:.0f} kcal and {week_total_protein:.1f}g protein. "
+            )
             st.caption(
                 f"Monday-start week, using {week_days_elapsed} elapsed day{'s' if week_days_elapsed != 1 else ''} "
                 f"from {format_day(week_start_day)} to {format_day(dashboard_anchor_day)}."

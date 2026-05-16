@@ -413,6 +413,14 @@ def shift_month(day_value: date, delta_months: int) -> date:
     return date(year, month, 1)
 
 
+def month_end(day_value: date) -> date:
+    return date(
+        day_value.year,
+        day_value.month,
+        calendar.monthrange(day_value.year, day_value.month)[1],
+    )
+
+
 def calorie_status_for_day(calories, goal):
     if pd.isna(calories) or pd.isna(goal):
         return "#e5e7eb", "No goal"
@@ -1838,6 +1846,18 @@ with tabs[2]:
 
     dashboard_month = st.session_state.dashboard_month
     month_prefix = dashboard_month.strftime("%Y-%m")
+    month_last_day = month_end(dashboard_month)
+    today_value = date.today()
+    if (dashboard_month.year, dashboard_month.month) < (today_value.year, today_value.month):
+        dashboard_anchor_day = month_last_day
+    elif (dashboard_month.year, dashboard_month.month) == (today_value.year, today_value.month):
+        dashboard_anchor_day = min(today_value, month_last_day)
+    else:
+        dashboard_anchor_day = dashboard_month
+    month_days_elapsed = max((dashboard_anchor_day - dashboard_month).days + 1, 1)
+    week_start_day = dashboard_anchor_day - timedelta(days=dashboard_anchor_day.weekday())
+    week_days_elapsed = dashboard_anchor_day.weekday() + 1
+    week_end_day = week_start_day + timedelta(days=6)
 
     agg = (
         logs.groupby("date")
@@ -1875,11 +1895,48 @@ with tabs[2]:
         protein_met_days = int(month_rows["protein_met"].sum())
         calorie_ok_days = int(month_rows["calorie_ok"].sum())
         logged_days = int(month_rows["has_log"].sum())
+        month_total_calories = float(month_rows["calories"].sum())
+        month_total_protein = float(month_rows["protein"].sum())
+        month_avg_calories = month_total_calories / month_days_elapsed
+        month_avg_protein = month_total_protein / month_days_elapsed
+
+        week_rows = month_rows.copy()
+        week_rows["parsed_date"] = week_rows["date"].apply(parse_date_value)
+        week_rows = week_rows[
+            week_rows["parsed_date"].notna()
+            & (week_rows["parsed_date"] >= week_start_day)
+            & (week_rows["parsed_date"] <= dashboard_anchor_day)
+        ].copy()
+        week_total_calories = float(week_rows["calories"].sum()) if not week_rows.empty else 0.0
+        week_total_protein = float(week_rows["protein"].sum()) if not week_rows.empty else 0.0
+        week_avg_calories = week_total_calories / week_days_elapsed
+        week_avg_protein = week_total_protein / week_days_elapsed
+        week_number = dashboard_anchor_day.isocalendar().week
 
         c1, c2, c3 = st.columns(3)
         c1.metric("Days logged", f"{logged_days}/{days_in_month}")
         c2.metric("Protein met", f"{protein_met_days}/{days_in_month}")
         c3.metric("Calories on target", f"{calorie_ok_days}/{days_in_month}")
+
+        avg_m1, avg_m2 = st.columns(2)
+        with avg_m1:
+            st.markdown("#### Month-to-date daily average")
+            mavg1, mavg2 = st.columns(2)
+            mavg1.metric("Calories", f"{month_avg_calories:.0f}")
+            mavg2.metric("Protein (g)", f"{month_avg_protein:.1f}")
+            st.caption(
+                f"Using {month_days_elapsed} elapsed day{'s' if month_days_elapsed != 1 else ''} "
+                f"through {format_day(dashboard_anchor_day)}."
+            )
+        with avg_m2:
+            st.markdown(f"#### Week {week_number} daily average")
+            wavg1, wavg2 = st.columns(2)
+            wavg1.metric("Calories", f"{week_avg_calories:.0f}")
+            wavg2.metric("Protein (g)", f"{week_avg_protein:.1f}")
+            st.caption(
+                f"Monday-start week, using {week_days_elapsed} elapsed day{'s' if week_days_elapsed != 1 else ''} "
+                f"from {format_day(week_start_day)} to {format_day(dashboard_anchor_day)}."
+            )
 
         calorie_map = {}
         protein_map = {}

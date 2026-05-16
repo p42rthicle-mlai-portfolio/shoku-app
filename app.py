@@ -729,6 +729,12 @@ def set_view_date_today():
     st.session_state.view_date = date.today()
 
 
+def shift_view_date(days: int):
+    current_view_date = st.session_state.get("view_date", date.today())
+    parsed_view_date = parse_date_value(current_view_date) or date.today()
+    st.session_state.view_date = parsed_view_date + timedelta(days=days)
+
+
 def log_entry_label(row) -> str:
     item_name = row["name"]
     if row.get("type") == "batch" and as_text(row.get("batch_id")):
@@ -1564,7 +1570,13 @@ with tabs[1]:
     st.subheader("Browse a day")
     colA, colB = st.columns([1, 1])
     with colA:
-        st.button("Today", key="view_today", on_click=set_view_date_today)
+        nav_col1, nav_col2, nav_col3 = st.columns([0.5, 1, 0.5])
+        with nav_col1:
+            st.button("←", key="view_prev_day", on_click=shift_view_date, args=(-1,))
+        with nav_col2:
+            st.button("Today", key="view_today", on_click=set_view_date_today)
+        with nav_col3:
+            st.button("→", key="view_next_day", on_click=shift_view_date, args=(1,))
         view_date = st.date_input(
             "Pick a date",
             value=date.today(),

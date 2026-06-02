@@ -56,19 +56,71 @@ BATCHES_CSV = DATA_DIR / "batches.csv"
 BATCH_ING_CSV = DATA_DIR / "batch_ingredients.csv"
 BACKUP_ZIP = Path(__file__).parent / "backup_data.zip"
 
+TRACKED_NUTRIENTS = [
+    {
+        "key": "calories",
+        "label": "Calories",
+        "unit": "kcal",
+        "decimals": 0,
+        "food_base_col": "calories_base",
+        "food_per_unit_col": "cal_per_unit",
+        "dish_override_col": "cal_override",
+        "log_col": "calories",
+        "batch_total_col": "total_calories",
+    },
+    {
+        "key": "protein",
+        "label": "Protein",
+        "unit": "g",
+        "decimals": 1,
+        "food_base_col": "protein_base",
+        "food_per_unit_col": "protein_per_unit",
+        "dish_override_col": "protein_override",
+        "log_col": "protein",
+        "batch_total_col": "total_protein",
+    },
+    {
+        "key": "fiber",
+        "label": "Fiber",
+        "unit": "g",
+        "decimals": 1,
+        "food_base_col": "fiber_base",
+        "food_per_unit_col": "fiber_per_unit",
+        "dish_override_col": "fiber_override",
+        "log_col": "fiber",
+        "batch_total_col": "total_fiber",
+    },
+]
+NUTRIENT_BY_KEY = {spec["key"]: spec for spec in TRACKED_NUTRIENTS}
+FOOD_NUMERIC_COLUMNS = ["base_qty"] + [
+    col
+    for spec in TRACKED_NUTRIENTS
+    for col in [spec["food_base_col"], spec["food_per_unit_col"]]
+]
+DISH_NUMERIC_COLUMNS = ["servings", "yield_qty"] + [
+    spec["dish_override_col"] for spec in TRACKED_NUTRIENTS
+]
+LOG_NUMERIC_COLUMNS = ["qty"] + [spec["log_col"] for spec in TRACKED_NUTRIENTS]
+BATCH_NUMERIC_COLUMNS = ["servings", "final_qty"] + [
+    spec["batch_total_col"] for spec in TRACKED_NUTRIENTS
+]
+
 FOOD_COLUMNS = [
     "food_name",
     "unit",
     "base_qty",
     "calories_base",
     "protein_base",
+    "fiber_base",
     "cal_per_unit",
     "protein_per_unit",
+    "fiber_per_unit",
 ]
 DISH_COLUMNS = [
     "dish_name",
     "cal_override",
     "protein_override",
+    "fiber_override",
     "servings",
     "yield_qty",
     "yield_unit",
@@ -91,6 +143,7 @@ LOG_COLUMNS = [
     "qty",
     "calories",
     "protein",
+    "fiber",
     "checked",
 ]
 BATCH_COLUMNS = [
@@ -103,6 +156,7 @@ BATCH_COLUMNS = [
     "yield_source",
     "total_calories",
     "total_protein",
+    "total_fiber",
     "notes",
 ]
 BATCH_INGREDIENT_COLUMNS = [
@@ -154,10 +208,10 @@ def load_all():
     batches = ensure_csv(BATCHES_CSV, BATCH_COLUMNS)
     batch_ings = ensure_csv(BATCH_ING_CSV, BATCH_INGREDIENT_COLUMNS)
     # Coerce types
-    for col in ["base_qty", "calories_base", "protein_base", "cal_per_unit", "protein_per_unit"]:
+    for col in FOOD_NUMERIC_COLUMNS:
         if col in foods.columns:
             foods[col] = pd.to_numeric(foods[col], errors="coerce")
-    for col in ["cal_override", "protein_override", "servings", "yield_qty"]:
+    for col in DISH_NUMERIC_COLUMNS:
         if col in dishes.columns:
             dishes[col] = pd.to_numeric(dishes[col], errors="coerce")
     for col in ["ingredient_qty_per_serving"]:
@@ -166,13 +220,13 @@ def load_all():
     for col in ["calorie_goal", "protein_goal"]:
         if col in goals.columns:
             goals[col] = pd.to_numeric(goals[col], errors="coerce")
-    for col in ["qty", "calories", "protein"]:
+    for col in LOG_NUMERIC_COLUMNS:
         if col in logs.columns:
             logs[col] = pd.to_numeric(logs[col], errors="coerce")
     logs = ensure_log_ids(logs)
     if "checked" in logs.columns:
         logs["checked"] = to_bool_series(logs["checked"])
-    for col in ["servings", "final_qty", "total_calories", "total_protein"]:
+    for col in BATCH_NUMERIC_COLUMNS:
         if col in batches.columns:
             batches[col] = pd.to_numeric(batches[col], errors="coerce")
     for col in ["ingredient_qty"]:
@@ -381,6 +435,34 @@ def as_text(value) -> str:
     return str(value).strip()
 
 
+def format_nutrient_value(nutrient_key: str, value, with_unit: bool = False) -> str:
+    spec = NUTRIENT_BY_KEY[nutrient_key]
+    if pd.isna(value):
+        return "—"
+    fmt = f"{{:.{spec['decimals']}f}}"
+    text = fmt.format(as_float(value, 0.0))
+    return f"{text} {spec['unit']}" if with_unit else text
+
+
+def get_missing_food_nutrients(food_row) -> list[str]:
+    if food_row is None:
+        return [spec["key"] for spec in TRACKED_NUTRIENTS]
+    return [
+        spec["key"]
+        for spec in TRACKED_NUTRIENTS
+        if pd.isna(food_row.get(spec["food_base_col"]))
+    ]
+
+
+def describe_missing_nutrients(nutrient_keys: list[str]) -> str:
+    if not nutrient_keys:
+        return ""
+    labels = [NUTRIENT_BY_KEY[key]["label"].lower() for key in nutrient_keys]
+    if len(labels) == 1:
+        return labels[0]
+    return ", ".join(labels[:-1]) + f", and {labels[-1]}"
+
+
 def parse_date_value(value):
     if isinstance(value, date):
         return value
@@ -401,6 +483,42 @@ def format_day(day_value) -> str:
 
 def format_date_series(values: pd.Series) -> pd.Series:
     return values.apply(format_day)
+
+
+def apply_effective_goals(
+    df: pd.DataFrame, goals: pd.DataFrame, date_col: str = "date"
+) -> pd.DataFrame:
+    result = df.copy()
+    if "calorie_goal" not in result.columns:
+        result["calorie_goal"] = None
+    if "protein_goal" not in result.columns:
+        result["protein_goal"] = None
+    if result.empty:
+        return result
+
+    result["_goal_lookup_date"] = pd.to_datetime(result[date_col], errors="coerce")
+    if goals.empty:
+        result = result.drop(columns=["_goal_lookup_date"])
+        return result
+
+    goal_lookup = goals[["date", "calorie_goal", "protein_goal"]].copy()
+    goal_lookup["_goal_lookup_date"] = pd.to_datetime(goal_lookup["date"], errors="coerce")
+    goal_lookup = goal_lookup.dropna(subset=["_goal_lookup_date"]).sort_values("_goal_lookup_date")
+    result = result.sort_values("_goal_lookup_date")
+
+    merged = pd.merge_asof(
+        result,
+        goal_lookup[["_goal_lookup_date", "calorie_goal", "protein_goal"]],
+        on="_goal_lookup_date",
+        direction="backward",
+        suffixes=("", "_effective"),
+    )
+    for col in ["calorie_goal", "protein_goal"]:
+        effective_col = f"{col}_effective"
+        if effective_col in merged.columns:
+            merged[col] = merged[effective_col].combine_first(merged[col])
+            merged = merged.drop(columns=[effective_col])
+    return merged.drop(columns=["_goal_lookup_date"])
 
 
 def month_start(day_value: date) -> date:
@@ -445,6 +563,45 @@ def protein_status_for_day(protein, goal):
     if protein >= goal * 0.9:
         return "#9ca3af", f"{protein:.1f} / {goal:.1f}g"
     return "#c62828", f"{protein:.1f} / {goal:.1f}g"
+
+
+def classify_calorie_progress(consumed: float, goal: float) -> tuple[str, str]:
+    if goal <= 0:
+        return "none", "No goal"
+    if consumed <= goal:
+        return "good", "Under budget"
+    if consumed <= goal * 1.04:
+        return "close", "Within range"
+    return "bad", "Over budget"
+
+
+def classify_protein_progress(consumed: float, goal: float) -> tuple[str, str]:
+    if goal <= 0:
+        return "none", "No goal"
+    if consumed >= goal:
+        return "good", "Goal met"
+    if consumed >= goal * 0.9:
+        return "close", "Close"
+    return "bad", "Not met"
+
+
+def classify_overall_goal_status(
+    calories_consumed: float,
+    calorie_goal: float | None,
+    protein_consumed: float,
+    protein_goal: float | None,
+) -> tuple[str, str, str]:
+    if calorie_goal is None or protein_goal is None:
+        return "#6b7280", "Goal status unavailable", "Add calorie and protein goals"
+
+    calorie_state, _ = classify_calorie_progress(calories_consumed, float(calorie_goal))
+    protein_state, _ = classify_protein_progress(protein_consumed, float(protein_goal))
+
+    if "bad" in {calorie_state, protein_state}:
+        return "#c62828", "Needs attention", "Outside target range"
+    if calorie_state == "good" and protein_state == "good":
+        return "#2e7d32", "On track", "Within target range"
+    return "#6b7280", "Within range", "Inside tolerance band"
 
 
 def render_month_heatmap(title: str, month_value: date, values_by_day: dict, status_fn):
@@ -566,17 +723,23 @@ def get_food_row(foods: pd.DataFrame, food_name: str, unit: str):
 
 def compute_ingredient_totals(
     ingredients: pd.DataFrame, foods: pd.DataFrame, qty_column: str
-) -> Tuple[float, float]:
-    total_c = 0.0
-    total_p = 0.0
+):
+    totals = {spec["key"]: 0.0 for spec in TRACKED_NUTRIENTS}
+    missing_nutrients = set()
     for _, ing in ingredients.iterrows():
         frow = get_food_row(foods, ing["ingredient_food_name"], ing["ingredient_unit"])
         if frow is None:
             continue
         qty = as_float(ing[qty_column], 0.0)
-        total_c += qty * as_float(frow["cal_per_unit"], 0.0)
-        total_p += qty * as_float(frow["protein_per_unit"], 0.0)
-    return total_c, total_p
+        for spec in TRACKED_NUTRIENTS:
+            per_unit_value = frow.get(spec["food_per_unit_col"])
+            if pd.isna(per_unit_value):
+                missing_nutrients.add(spec["key"])
+            else:
+                totals[spec["key"]] += qty * as_float(per_unit_value, 0.0)
+    for nutrient_key in missing_nutrients:
+        totals[nutrient_key] = None
+    return totals, sorted(missing_nutrients)
 
 
 def get_auto_yield_from_ingredients(
@@ -601,12 +764,12 @@ def get_auto_yield_from_ingredients(
 
 def build_portion_metrics(
     servings: float,
-    total_calories: float,
-    total_protein: float,
+    nutrient_totals: dict,
     manual_qty: float,
     manual_unit: str,
     auto_qty: float = 0.0,
     auto_unit: str = "",
+    missing_nutrients: list[str] | None = None,
 ):
     final_qty = 0.0
     final_unit = ""
@@ -622,41 +785,52 @@ def build_portion_metrics(
 
     has_weight_basis = final_qty > 0 and bool(final_unit)
     safe_servings = servings if servings > 0 else 1.0
-    return {
+    metrics = {
         "servings": safe_servings,
-        "total_calories": total_calories,
-        "total_protein": total_protein,
-        "per_serving_calories": total_calories / safe_servings,
-        "per_serving_protein": total_protein / safe_servings,
         "final_qty": final_qty,
         "final_unit": final_unit,
         "yield_source": yield_source,
         "has_weight_basis": has_weight_basis,
-        "per_weight_calories": total_calories / final_qty if has_weight_basis else 0.0,
-        "per_weight_protein": total_protein / final_qty if has_weight_basis else 0.0,
+        "missing_nutrients": missing_nutrients or [],
+        "has_complete_nutrients": not bool(missing_nutrients),
     }
+    for spec in TRACKED_NUTRIENTS:
+        total_value = nutrient_totals.get(spec["key"])
+        total_col = spec["batch_total_col"]
+        per_serving_col = f"per_serving_{spec['key']}"
+        per_weight_col = f"per_weight_{spec['key']}"
+        metrics[total_col] = total_value
+        metrics[per_serving_col] = (
+            total_value / safe_servings if pd.notna(total_value) else None
+        )
+        metrics[per_weight_col] = (
+            total_value / final_qty if has_weight_basis and pd.notna(total_value) else None
+        )
+    return metrics
 
 
 def normalize_food_row(row):
     base_qty = as_float(row.get("base_qty"), 0.0)
-    cal_per_unit = as_float(row.get("cal_per_unit"), 0.0)
-    protein_per_unit = as_float(row.get("protein_per_unit"), 0.0)
 
     if base_qty <= 0:
         base_qty = 1.0
 
-    calories_base = row.get("calories_base")
-    protein_base = row.get("protein_base")
-    if pd.isna(calories_base):
-        calories_base = cal_per_unit * base_qty
-    if pd.isna(protein_base):
-        protein_base = protein_per_unit * base_qty
-
     row["base_qty"] = base_qty
-    row["calories_base"] = as_float(calories_base, 0.0)
-    row["protein_base"] = as_float(protein_base, 0.0)
-    row["cal_per_unit"] = row["calories_base"] / base_qty
-    row["protein_per_unit"] = row["protein_base"] / base_qty
+    for spec in TRACKED_NUTRIENTS:
+        per_unit_col = spec["food_per_unit_col"]
+        base_col = spec["food_base_col"]
+        per_unit_value = row.get(per_unit_col)
+        base_value = row.get(base_col)
+        if pd.isna(base_value):
+            if pd.isna(per_unit_value):
+                row[base_col] = None
+                row[per_unit_col] = None
+            else:
+                row[base_col] = as_float(per_unit_value, 0.0) * base_qty
+                row[per_unit_col] = as_float(per_unit_value, 0.0)
+        else:
+            row[base_col] = as_float(base_value, 0.0)
+            row[per_unit_col] = row[base_col] / base_qty
     return row
 
 
@@ -668,6 +842,7 @@ def clear_add_food_form():
             "add_base_qty",
             "add_cal_base",
             "add_prot_base",
+            "add_fiber_base",
         ]
     )
 
@@ -679,6 +854,7 @@ def clear_add_dish_form():
             "add_dish_override",
             "add_dish_cal",
             "add_dish_prot",
+            "add_dish_fiber",
             "add_dish_servings",
             "add_dish_yield_qty",
             "add_dish_yield_unit",
@@ -735,6 +911,19 @@ def shift_view_date(days: int):
     st.session_state.view_date = parsed_view_date + timedelta(days=days)
 
 
+def load_food_into_edit_form(food_row, food_key_value: str):
+    st.session_state.edit_food_name = as_text(food_row["food_name"])
+    st.session_state.edit_food_unit = as_text(food_row["unit"])
+    st.session_state.edit_base_qty = float(as_float(food_row["base_qty"], 1.0))
+    st.session_state.edit_cal_base = float(as_float(food_row["calories_base"], 0.0))
+    st.session_state.edit_prot_base = float(as_float(food_row["protein_base"], 0.0))
+    st.session_state.edit_fiber_base = (
+        "" if pd.isna(food_row["fiber_base"]) else format_nutrient_value("fiber", food_row["fiber_base"])
+    )
+    st.session_state.edit_food_propagate = True
+    st.session_state.edit_food_loaded_for = food_key_value
+
+
 def log_entry_label(row) -> str:
     item_name = row["name"]
     if row.get("type") == "batch" and as_text(row.get("batch_id")):
@@ -744,7 +933,8 @@ def log_entry_label(row) -> str:
         f"{row['meal']} - {row['type']} - {item_name} "
         f"({as_float(row['qty'], 0.0):g} {row['unit']}, "
         f"{as_float(row['calories'], 0.0):.0f} kcal, "
-        f"{as_float(row['protein'], 0.0):.1f}g protein)"
+        f"{as_float(row['protein'], 0.0):.1f}g protein, "
+        f"{format_nutrient_value('fiber', row.get('fiber'), with_unit=True)} fiber)"
         f" [{short_log_id}]"
     )
 
@@ -822,20 +1012,24 @@ def render_goal_progress(
     label: str, consumed: float, goal: float, good_when_under: bool
 ):
     green = "#2e7d32"
+    neutral = "#6b7280"
     red = "#c62828"
     track = "#ebedf0"
     if goal <= 0:
         fill_pct = 0.0
-        ok = False
+        state = "none"
+        status = "No goal"
     else:
         fill_pct = min(consumed / goal, 1.0) * 100
-        ok = consumed <= goal if good_when_under else consumed >= goal
-    color = green if ok else red
-    status = (
-        "Under budget" if good_when_under and ok else
-        "Over budget" if good_when_under else
-        "Goal met" if ok else
-        "Not met"
+        if good_when_under:
+            state, status = classify_calorie_progress(consumed, goal)
+        else:
+            state, status = classify_protein_progress(consumed, goal)
+    color = (
+        green if state == "good"
+        else neutral if state == "close"
+        else red if state == "bad"
+        else "#9ca3af"
     )
 
     st.markdown(
@@ -896,14 +1090,23 @@ def get_dish_servings(row) -> float:
 
 def compute_dish_totals(
     dish_name: str, dishes: pd.DataFrame, dings: pd.DataFrame, foods: pd.DataFrame
-) -> Tuple[float, float]:
+):
     md = dishes[dishes["dish_name"] == dish_name]
     if md.empty:
-        return 0.0, 0.0
+        return {spec["key"]: 0.0 for spec in TRACKED_NUTRIENTS}, []
     row = md.iloc[0]
     if is_override_dish(row):
         servings = get_dish_servings(row)
-        return float(row["cal_override"]) * servings, float(row["protein_override"]) * servings
+        totals = {}
+        missing_nutrients = []
+        for spec in TRACKED_NUTRIENTS:
+            override_value = row.get(spec["dish_override_col"])
+            if pd.isna(override_value):
+                totals[spec["key"]] = None
+                missing_nutrients.append(spec["key"])
+            else:
+                totals[spec["key"]] = as_float(override_value, 0.0) * servings
+        return totals, missing_nutrients
 
     use = dings[dings["dish_name"] == dish_name]
     return compute_ingredient_totals(use, foods, "ingredient_qty_per_serving")
@@ -935,33 +1138,26 @@ def get_dish_metrics(
 ):
     md = dishes[dishes["dish_name"] == dish_name]
     if md.empty:
-        return {
-            "servings": 1.0,
-            "total_calories": 0.0,
-            "total_protein": 0.0,
-            "per_serving_calories": 0.0,
-            "per_serving_protein": 0.0,
-            "final_qty": 0.0,
-            "final_unit": "",
-            "yield_source": "none",
-            "has_weight_basis": False,
-            "per_weight_calories": 0.0,
-            "per_weight_protein": 0.0,
-        }
+        return build_portion_metrics(
+            1.0,
+            {spec["key"]: 0.0 for spec in TRACKED_NUTRIENTS},
+            0.0,
+            "",
+        )
 
     row = md.iloc[0]
     servings = get_dish_servings(row)
-    total_c, total_p = compute_dish_totals(dish_name, dishes, dings, foods)
+    nutrient_totals, missing_nutrients = compute_dish_totals(dish_name, dishes, dings, foods)
     manual_qty, manual_unit = get_dish_yield(row)
     auto_qty, auto_unit = get_auto_dish_yield(dish_name, dings)
     return build_portion_metrics(
         servings,
-        total_c,
-        total_p,
+        nutrient_totals,
         manual_qty,
         manual_unit,
         auto_qty,
         auto_unit,
+        missing_nutrients,
     )
 
 
@@ -991,13 +1187,19 @@ def compute_dish_base(
     dings: pd.DataFrame,
     foods: pd.DataFrame,
     log_unit: str = "serving",
-) -> Tuple[float, float]:
+):
     metrics = get_dish_metrics(dish_name, dishes, dings, foods)
     if log_unit == "serving":
-        return metrics["per_serving_calories"], metrics["per_serving_protein"]
+        return {
+            spec["key"]: metrics[f"per_serving_{spec['key']}"]
+            for spec in TRACKED_NUTRIENTS
+        }
     if metrics["has_weight_basis"] and log_unit == metrics["final_unit"]:
-        return metrics["per_weight_calories"], metrics["per_weight_protein"]
-    return 0.0, 0.0
+        return {
+            spec["key"]: metrics[f"per_weight_{spec['key']}"]
+            for spec in TRACKED_NUTRIENTS
+        }
+    return {spec["key"]: 0.0 for spec in TRACKED_NUTRIENTS}
 
 
 def make_batch_id(batch_day: date) -> str:
@@ -1013,13 +1215,22 @@ def get_batch_row(batches: pd.DataFrame, batch_id: str):
 
 def get_batch_metrics(batch_row):
     if batch_row is None:
-        return build_portion_metrics(1.0, 0.0, 0.0, 0.0, "")
+        return build_portion_metrics(
+            1.0, {spec["key"]: 0.0 for spec in TRACKED_NUTRIENTS}, 0.0, ""
+        )
     return build_portion_metrics(
         as_float(batch_row.get("servings"), 1.0),
-        as_float(batch_row.get("total_calories"), 0.0),
-        as_float(batch_row.get("total_protein"), 0.0),
+        {
+            spec["key"]: batch_row.get(spec["batch_total_col"])
+            for spec in TRACKED_NUTRIENTS
+        },
         as_float(batch_row.get("final_qty"), 0.0),
         as_text(batch_row.get("final_unit")),
+        missing_nutrients=[
+            spec["key"]
+            for spec in TRACKED_NUTRIENTS
+            if pd.isna(batch_row.get(spec["batch_total_col"]))
+        ],
     )
 
 
@@ -1038,13 +1249,19 @@ def get_batch_log_options(batch_row):
     return options
 
 
-def compute_batch_base(batch_row, log_unit: str = "serving") -> Tuple[float, float]:
+def compute_batch_base(batch_row, log_unit: str = "serving"):
     metrics = get_batch_metrics(batch_row)
     if log_unit == "serving":
-        return metrics["per_serving_calories"], metrics["per_serving_protein"]
+        return {
+            spec["key"]: metrics[f"per_serving_{spec['key']}"]
+            for spec in TRACKED_NUTRIENTS
+        }
     if metrics["has_weight_basis"] and log_unit == metrics["final_unit"]:
-        return metrics["per_weight_calories"], metrics["per_weight_protein"]
-    return 0.0, 0.0
+        return {
+            spec["key"]: metrics[f"per_weight_{spec['key']}"]
+            for spec in TRACKED_NUTRIENTS
+        }
+    return {spec["key"]: 0.0 for spec in TRACKED_NUTRIENTS}
 
 
 def get_batch_consumption_summary(logs: pd.DataFrame, batch_row) -> dict:
@@ -1091,10 +1308,14 @@ def get_batch_consumption_summary(logs: pd.DataFrame, batch_row) -> dict:
 
 
 def get_goal_for_date(goals: pd.DataFrame, day: date):
-    s = goals[goals["date"] == day.isoformat()]
-    if s.empty:
+    effective = apply_effective_goals(
+        pd.DataFrame({"date": [day.isoformat()]}), goals, "date"
+    )
+    if effective.empty:
         return None, None
-    r = s.iloc[0]
+    r = effective.iloc[0]
+    if pd.isna(r["calorie_goal"]) or pd.isna(r["protein_goal"]):
+        return None, None
     return float(r["calorie_goal"]), float(r["protein_goal"])
 
 
@@ -1120,6 +1341,7 @@ def add_log_entry(
     qty: float,
     cal: float,
     prot: float,
+    fiber: float | None,
     batch_id: str = "",
 ) -> pd.DataFrame:
     logs.loc[len(logs)] = [
@@ -1133,6 +1355,7 @@ def add_log_entry(
         qty,
         cal,
         prot,
+        fiber,
         False,
     ]
     return logs
@@ -1140,7 +1363,11 @@ def add_log_entry(
 
 def daily_totals(logs: pd.DataFrame, day: date):
     d = logs[logs["date"] == day.isoformat()]
-    return float(d["calories"].sum()), float(d["protein"].sum())
+    return (
+        float(d["calories"].sum()),
+        float(d["protein"].sum()),
+        float(pd.to_numeric(d["fiber"], errors="coerce").fillna(0.0).sum()),
+    )
 
 
 # --- Recalc helpers ---
@@ -1150,14 +1377,15 @@ def recalc_logs_for_food(
     frow = get_food_row(foods, food_name, unit)
     if frow is None:
         return logs
-    cal_per = as_float(frow["cal_per_unit"], 0.0)
-    prot_per = as_float(frow["protein_per_unit"], 0.0)
     mask = (
         (logs["type"] == "food") & (logs["name"] == food_name) & (logs["unit"] == unit)
     )
     qty = logs.loc[mask, "qty"].fillna(0).astype(float)
-    logs.loc[mask, "calories"] = qty * cal_per
-    logs.loc[mask, "protein"] = qty * prot_per
+    for spec in TRACKED_NUTRIENTS:
+        per_unit_value = frow.get(spec["food_per_unit_col"])
+        logs.loc[mask, spec["log_col"]] = (
+            qty * as_float(per_unit_value, 0.0) if pd.notna(per_unit_value) else None
+        )
     return logs
 
 
@@ -1177,12 +1405,13 @@ def recalc_logs_for_dishes(
             & (logs["unit"] == "serving")
         )
         serving_qty = logs.loc[serving_mask, "qty"].fillna(0).astype(float)
-        logs.loc[serving_mask, "calories"] = (
-            serving_qty * metrics["per_serving_calories"]
-        )
-        logs.loc[serving_mask, "protein"] = (
-            serving_qty * metrics["per_serving_protein"]
-        )
+        for spec in TRACKED_NUTRIENTS:
+            per_serving_value = metrics[f"per_serving_{spec['key']}"]
+            logs.loc[serving_mask, spec["log_col"]] = (
+                serving_qty * as_float(per_serving_value, 0.0)
+                if pd.notna(per_serving_value)
+                else None
+            )
 
         if metrics["has_weight_basis"]:
             weight_mask = (
@@ -1191,12 +1420,13 @@ def recalc_logs_for_dishes(
                 & (logs["unit"] == metrics["final_unit"])
             )
             weight_qty = logs.loc[weight_mask, "qty"].fillna(0).astype(float)
-            logs.loc[weight_mask, "calories"] = (
-                weight_qty * metrics["per_weight_calories"]
-            )
-            logs.loc[weight_mask, "protein"] = (
-                weight_qty * metrics["per_weight_protein"]
-            )
+            for spec in TRACKED_NUTRIENTS:
+                per_weight_value = metrics[f"per_weight_{spec['key']}"]
+                logs.loc[weight_mask, spec["log_col"]] = (
+                    weight_qty * as_float(per_weight_value, 0.0)
+                    if pd.notna(per_weight_value)
+                    else None
+                )
     return logs
 
 
@@ -1210,17 +1440,104 @@ def recalc_logs_for_batch(logs: pd.DataFrame, batch_row: pd.Series):
 
     serving_mask = mask & (logs["unit"] == "serving")
     serving_qty = pd.to_numeric(logs.loc[serving_mask, "qty"], errors="coerce").fillna(0.0)
-    logs.loc[serving_mask, "calories"] = serving_qty * metrics["per_serving_calories"]
-    logs.loc[serving_mask, "protein"] = serving_qty * metrics["per_serving_protein"]
+    for spec in TRACKED_NUTRIENTS:
+        per_serving_value = metrics[f"per_serving_{spec['key']}"]
+        logs.loc[serving_mask, spec["log_col"]] = (
+            serving_qty * as_float(per_serving_value, 0.0)
+            if pd.notna(per_serving_value)
+            else None
+        )
 
     non_serving_mask = mask & (logs["unit"] != "serving")
     if metrics["has_weight_basis"]:
         weight_qty = pd.to_numeric(logs.loc[non_serving_mask, "qty"], errors="coerce").fillna(0.0)
         logs.loc[non_serving_mask, "unit"] = metrics["final_unit"]
-        logs.loc[non_serving_mask, "calories"] = weight_qty * metrics["per_weight_calories"]
-        logs.loc[non_serving_mask, "protein"] = weight_qty * metrics["per_weight_protein"]
+        for spec in TRACKED_NUTRIENTS:
+            per_weight_value = metrics[f"per_weight_{spec['key']}"]
+            logs.loc[non_serving_mask, spec["log_col"]] = (
+                weight_qty * as_float(per_weight_value, 0.0)
+                if pd.notna(per_weight_value)
+                else None
+            )
 
     return logs
+
+
+def recalc_batches_for_food_refs(
+    batches: pd.DataFrame,
+    batch_ings: pd.DataFrame,
+    logs: pd.DataFrame,
+    foods: pd.DataFrame,
+    impacted_food_refs: list[tuple[str, str]],
+):
+    if not impacted_food_refs or batch_ings.empty or batches.empty:
+        return batches, logs
+
+    impacted_ref_set = {(name, unit) for name, unit in impacted_food_refs}
+    impacted_batch_ids = batch_ings[
+        batch_ings.apply(
+            lambda row: (
+                as_text(row["ingredient_food_name"]),
+                as_text(row["ingredient_unit"]),
+            )
+            in impacted_ref_set,
+            axis=1,
+        )
+    ]["batch_id"].dropna().astype(str).unique().tolist()
+
+    if not impacted_batch_ids:
+        return batches, logs
+
+    for batch_id in impacted_batch_ids:
+        batch_match = batches[batches["batch_id"] == batch_id]
+        if batch_match.empty:
+            continue
+        batch_index = batch_match.index[0]
+        batch_row = batch_match.iloc[0]
+        batch_snapshot = batch_ings[batch_ings["batch_id"] == batch_id].copy()
+        if batch_snapshot.empty:
+            continue
+
+        nutrient_totals, missing_nutrients = compute_ingredient_totals(
+            batch_snapshot, foods, "ingredient_qty"
+        )
+        auto_qty, auto_unit = get_auto_yield_from_ingredients(
+            batch_snapshot, "ingredient_qty"
+        )
+        manual_qty = (
+            as_float(batch_row["final_qty"], 0.0)
+            if as_text(batch_row.get("yield_source")) == "manual"
+            else 0.0
+        )
+        manual_unit = (
+            as_text(batch_row["final_unit"])
+            if as_text(batch_row.get("yield_source")) == "manual"
+            else ""
+        )
+        metrics = build_portion_metrics(
+            as_float(batch_row.get("servings"), 1.0),
+            nutrient_totals,
+            manual_qty,
+            manual_unit,
+            auto_qty,
+            auto_unit,
+            missing_nutrients,
+        )
+
+        batches.loc[batch_index, "final_qty"] = (
+            metrics["final_qty"] if metrics["has_weight_basis"] else None
+        )
+        batches.loc[batch_index, "final_unit"] = (
+            metrics["final_unit"] if metrics["has_weight_basis"] else None
+        )
+        batches.loc[batch_index, "yield_source"] = metrics["yield_source"]
+        for spec in TRACKED_NUTRIENTS:
+            batches.loc[batch_index, spec["batch_total_col"]] = metrics[spec["batch_total_col"]]
+
+        updated_batch_row = get_batch_row(batches, batch_id)
+        logs = recalc_logs_for_batch(logs, updated_batch_row)
+
+    return batches, logs
 
 
 # ---------- UI ----------
@@ -1352,20 +1669,31 @@ with tabs[0]:
             unit = st.selectbox("Unit", units, key="log_food_unit")
             frow = get_food_row(foods, f_name, unit)
             if frow is not None:
-                cal_per = as_float(frow["cal_per_unit"], 0.0)
-                prot_per = as_float(frow["protein_per_unit"], 0.0)
-                est_c = qty * cal_per
-                est_p = qty * prot_per
-                st.metric("Calories (est.)", f"{est_c:.0f}")
-                st.metric("Protein (g, est.)", f"{est_p:.1f}")
+                missing_nutrients = get_missing_food_nutrients(frow)
+                est_c = qty * as_float(frow["cal_per_unit"], 0.0)
+                est_p = qty * as_float(frow["protein_per_unit"], 0.0)
+                est_f = (
+                    qty * as_float(frow["fiber_per_unit"], 0.0)
+                    if pd.notna(frow.get("fiber_per_unit"))
+                    else None
+                )
+                n1, n2, n3 = st.columns(3)
+                n1.metric("Calories (est.)", f"{est_c:.0f}")
+                n2.metric("Protein (g, est.)", f"{est_p:.1f}")
+                n3.metric("Fiber (g, est.)", format_nutrient_value("fiber", est_f))
+                if missing_nutrients:
+                    st.warning(
+                        f"This food cannot be logged until its {describe_missing_nutrients(missing_nutrients)} value is set."
+                    )
                 if st.button(
                     "Add to log",
                     type="primary",
                     use_container_width=True,
                     key="add_food_log",
+                    disabled=bool(missing_nutrients),
                 ):
                     logs = add_log_entry(
-                        logs, log_date, meal, "food", f_name, unit, qty, est_c, est_p
+                        logs, log_date, meal, "food", f_name, unit, qty, est_c, est_p, est_f
                     )
                     save_df(logs, LOGS_CSV)
                     clear_log_form()
@@ -1386,16 +1714,26 @@ with tabs[0]:
             option_map = {label: unit for unit, label in log_options}
             selected_label = st.selectbox("Log by", option_labels, key="log_dish_basis")
             log_unit = option_map[selected_label]
-            base_c, base_p = compute_dish_base(d_name, dishes, dings, foods, log_unit)
+            base_values = compute_dish_base(d_name, dishes, dings, foods, log_unit)
             basis_label = get_dish_basis_label(log_unit)
-            est_c = qty * base_c
-            est_p = qty * base_p
+            est_c = qty * as_float(base_values["calories"], 0.0)
+            est_p = qty * as_float(base_values["protein"], 0.0)
+            est_f = (
+                qty * as_float(base_values["fiber"], 0.0)
+                if pd.notna(base_values["fiber"])
+                else None
+            )
 
-            info_cols = st.columns(2)
+            info_cols = st.columns(3)
             with info_cols[0]:
                 st.metric("Calories per serving", f"{dish_metrics['per_serving_calories']:.1f}")
                 st.metric("Protein per serving (g)", f"{dish_metrics['per_serving_protein']:.2f}")
             with info_cols[1]:
+                st.metric(
+                    "Fiber per serving (g)",
+                    format_nutrient_value("fiber", dish_metrics["per_serving_fiber"]),
+                )
+            with info_cols[2]:
                 if dish_metrics["has_weight_basis"]:
                     source_label = (
                         "Manual final weight"
@@ -1410,6 +1748,10 @@ with tabs[0]:
                         f"Protein per {dish_metrics['final_unit']} (g)",
                         f"{dish_metrics['per_weight_protein']:.3f}",
                     )
+                    st.metric(
+                        f"Fiber per {dish_metrics['final_unit']} (g)",
+                        format_nutrient_value("fiber", dish_metrics["per_weight_fiber"]),
+                    )
                     st.caption(
                         f"{source_label}: {dish_metrics['final_qty']:.0f} {dish_metrics['final_unit']} total, "
                         f"{dish_metrics['servings']:.0f} servings, "
@@ -1420,23 +1762,35 @@ with tabs[0]:
                         "Weight logging becomes available when you add a manual final dish quantity or when all ingredient quantities share the same unit and can be auto-summed."
                     )
 
-            st.metric(f"Calories {basis_label}", f"{base_c:.2f}")
-            st.metric(f"Protein {basis_label} (g)", f"{base_p:.3f}")
+            base_cols = st.columns(3)
+            base_cols[0].metric(f"Calories {basis_label}", f"{as_float(base_values['calories'], 0.0):.2f}")
+            base_cols[1].metric(f"Protein {basis_label} (g)", f"{as_float(base_values['protein'], 0.0):.3f}")
+            base_cols[2].metric(
+                f"Fiber {basis_label} (g)",
+                format_nutrient_value("fiber", base_values["fiber"]),
+            )
             if log_unit == "serving" and dish_metrics["has_weight_basis"]:
                 st.caption(
                     f"1 serving = {dish_metrics['final_qty'] / dish_metrics['servings']:.1f} "
                     f"{dish_metrics['final_unit']}"
                 )
-            st.metric("Calories (this entry)", f"{est_c:.0f}")
-            st.metric("Protein (this entry, g)", f"{est_p:.1f}")
+            entry_cols = st.columns(3)
+            entry_cols[0].metric("Calories (this entry)", f"{est_c:.0f}")
+            entry_cols[1].metric("Protein (this entry, g)", f"{est_p:.1f}")
+            entry_cols[2].metric("Fiber (this entry, g)", format_nutrient_value("fiber", est_f))
+            if dish_metrics["missing_nutrients"]:
+                st.warning(
+                    f"This dish cannot be logged until its {describe_missing_nutrients(dish_metrics['missing_nutrients'])} value is available."
+                )
             if st.button(
                 "Add to log",
                 type="primary",
                 use_container_width=True,
                 key="add_dish_log",
+                disabled=bool(dish_metrics["missing_nutrients"]),
             ):
                 logs = add_log_entry(
-                    logs, log_date, meal, "dish", d_name, log_unit, qty, est_c, est_p
+                    logs, log_date, meal, "dish", d_name, log_unit, qty, est_c, est_p, est_f
                 )
                 save_df(logs, LOGS_CSV)
                 clear_log_form()
@@ -1464,16 +1818,26 @@ with tabs[0]:
             option_map = {label: unit for unit, label in log_options}
             selected_label = st.selectbox("Log by", option_labels, key="log_batch_basis")
             log_unit = option_map[selected_label]
-            base_c, base_p = compute_batch_base(batch_row, log_unit)
+            base_values = compute_batch_base(batch_row, log_unit)
             basis_label = get_dish_basis_label(log_unit)
-            est_c = qty * base_c
-            est_p = qty * base_p
+            est_c = qty * as_float(base_values["calories"], 0.0)
+            est_p = qty * as_float(base_values["protein"], 0.0)
+            est_f = (
+                qty * as_float(base_values["fiber"], 0.0)
+                if pd.notna(base_values["fiber"])
+                else None
+            )
 
-            info_cols = st.columns(2)
+            info_cols = st.columns(3)
             with info_cols[0]:
                 st.metric("Calories per serving", f"{batch_metrics['per_serving_calories']:.1f}")
                 st.metric("Protein per serving (g)", f"{batch_metrics['per_serving_protein']:.2f}")
             with info_cols[1]:
+                st.metric(
+                    "Fiber per serving (g)",
+                    format_nutrient_value("fiber", batch_metrics["per_serving_fiber"]),
+                )
+            with info_cols[2]:
                 if batch_metrics["has_weight_basis"]:
                     source_label = (
                         "Manual final weight"
@@ -1487,6 +1851,10 @@ with tabs[0]:
                     st.metric(
                         f"Protein per {batch_metrics['final_unit']} (g)",
                         f"{batch_metrics['per_weight_protein']:.3f}",
+                    )
+                    st.metric(
+                        f"Fiber per {batch_metrics['final_unit']} (g)",
+                        format_nutrient_value("fiber", batch_metrics["per_weight_fiber"]),
                     )
                     st.caption(
                         f"{source_label}: {batch_metrics['final_qty']:.0f} {batch_metrics['final_unit']} total, "
@@ -1533,20 +1901,32 @@ with tabs[0]:
                         f"{batch_consumption['over_servings']:.2f} servings."
                     )
 
-            st.metric(f"Calories {basis_label}", f"{base_c:.2f}")
-            st.metric(f"Protein {basis_label} (g)", f"{base_p:.3f}")
+            base_cols = st.columns(3)
+            base_cols[0].metric(f"Calories {basis_label}", f"{as_float(base_values['calories'], 0.0):.2f}")
+            base_cols[1].metric(f"Protein {basis_label} (g)", f"{as_float(base_values['protein'], 0.0):.3f}")
+            base_cols[2].metric(
+                f"Fiber {basis_label} (g)",
+                format_nutrient_value("fiber", base_values["fiber"]),
+            )
             if log_unit == "serving" and batch_metrics["has_weight_basis"]:
                 st.caption(
                     f"1 serving = {batch_metrics['final_qty'] / batch_metrics['servings']:.1f} "
                     f"{batch_metrics['final_unit']}"
                 )
-            st.metric("Calories (this entry)", f"{est_c:.0f}")
-            st.metric("Protein (this entry, g)", f"{est_p:.1f}")
+            entry_cols = st.columns(3)
+            entry_cols[0].metric("Calories (this entry)", f"{est_c:.0f}")
+            entry_cols[1].metric("Protein (this entry, g)", f"{est_p:.1f}")
+            entry_cols[2].metric("Fiber (this entry, g)", format_nutrient_value("fiber", est_f))
+            if batch_metrics["missing_nutrients"]:
+                st.warning(
+                    f"This batch cannot be logged until its {describe_missing_nutrients(batch_metrics['missing_nutrients'])} value is available."
+                )
             if st.button(
                 "Add to log",
                 type="primary",
                 use_container_width=True,
                 key="add_batch_log",
+                disabled=bool(batch_metrics["missing_nutrients"]),
             ):
                 logs = add_log_entry(
                     logs,
@@ -1558,6 +1938,7 @@ with tabs[0]:
                     qty,
                     est_c,
                     est_p,
+                    est_f,
                     batch_id=batch_id,
                 )
                 save_df(logs, LOGS_CSV)
@@ -1582,6 +1963,10 @@ with tabs[1]:
             value=date.today(),
             format=DATE_INPUT_FORMAT,
             key="view_date",
+        )
+        st.markdown(
+            f"<div style='font-size:1.08rem;font-weight:700;color:#374151;margin-top:0.28rem;line-height:1.3;'>{view_date.strftime('%A')}</div>",
+            unsafe_allow_html=True,
         )
     with colB:
         st.write("Daily goals")
@@ -1643,23 +2028,26 @@ with tabs[1]:
                     st.rerun()
 
     day_logs = logs[logs["date"] == view_date.isoformat()].copy()
-    tot_c, tot_p = daily_totals(logs, view_date)
+    tot_c, tot_p, tot_f = daily_totals(logs, view_date)
     st.markdown("### Daily totals")
-    m1, m2, m3 = st.columns(3)
+    m1, m2, m3, m4 = st.columns(4)
     m1.metric("Calories", f"{tot_c:.0f}")
     m2.metric("Protein (g)", f"{tot_p:.1f}")
+    m3.metric("Fiber (g)", f"{tot_f:.1f}")
     if gcal is not None and gprot is not None:
-        ok_c = tot_c <= gcal
-        ok_p = tot_p >= gprot
-        status_color = "#2e7d32" if ok_c and ok_p else "#c62828"
-        status_text = "On track" if ok_c and ok_p else "Needs attention"
-        m3.markdown(
+        status_color, status_text, status_detail = classify_overall_goal_status(
+            tot_c, gcal, tot_p, gprot
+        )
+        m4.markdown(
             f"""
             <div style="font-size:0.78rem;text-transform:uppercase;letter-spacing:0.04em;color:#666;">
                 Overall
             </div>
             <div style="font-size:0.95rem;font-weight:700;color:{status_color};line-height:1.35;">
                 {status_text}
+            </div>
+            <div style="font-size:0.8rem;color:#6b7280;line-height:1.3;margin-top:0.12rem;">
+                {status_detail}
             </div>
             """,
             unsafe_allow_html=True,
@@ -1671,7 +2059,7 @@ with tabs[1]:
         with p2:
             render_goal_progress("Protein", tot_p, float(gprot), good_when_under=False)
     else:
-        m3.caption("Set daily goals to see calorie and protein status.")
+        m4.caption("Set daily goals to see calorie and protein status.")
 
     if day_logs.empty:
         st.info("No entries for this date.")
@@ -1691,12 +2079,14 @@ with tabs[1]:
             st.markdown(f"### {meal_name}")
             meal_calories = float(sub["calories"].sum())
             meal_protein = float(sub["protein"].sum())
-            meal_m1, meal_m2 = st.columns(2)
+            meal_fiber = float(pd.to_numeric(sub["fiber"], errors="coerce").fillna(0.0).sum())
+            meal_m1, meal_m2, meal_m3 = st.columns(3)
             meal_m1.metric("Meal calories", f"{meal_calories:.0f}")
             meal_m2.metric("Meal protein (g)", f"{meal_protein:.1f}")
+            meal_m3.metric("Meal fiber (g)", f"{meal_fiber:.1f}")
             with st.container(border=True):
-                header_cols = st.columns([0.5, 1.1, 3.2, 1, 1, 1.2, 1.2])
-                header_labels = ["", "Type", "Item", "Unit", "Qty", "Calories", "Protein (g)"]
+                header_cols = st.columns([0.5, 1.0, 2.9, 1, 1, 1.1, 1.1, 1.1])
+                header_labels = ["", "Type", "Item", "Unit", "Qty", "Calories", "Protein (g)", "Fiber (g)"]
                 for col, label in zip(header_cols, header_labels):
                     col.markdown(
                         f"<div style='font-size:0.78rem;color:#666;font-weight:700;'>{label}</div>",
@@ -1708,7 +2098,7 @@ with tabs[1]:
                 )
 
                 for row_pos, (idx, row) in enumerate(sub.iterrows()):
-                    row_cols = st.columns([0.5, 1.1, 3.2, 1, 1, 1.2, 1.2])
+                    row_cols = st.columns([0.5, 1.0, 2.9, 1, 1, 1.1, 1.1, 1.1])
                     log_id = as_text(row.get("log_id"))
                     checkbox_key = f"day_view_done_{log_id}"
                     if checkbox_key not in st.session_state:
@@ -1729,6 +2119,7 @@ with tabs[1]:
                     row_cols[4].write(f"{as_float(row['qty'], 0.0):g}")
                     row_cols[5].write(f"{as_float(row['calories'], 0.0):.0f}")
                     row_cols[6].write(f"{as_float(row['protein'], 0.0):.1f}")
+                    row_cols[7].write(format_nutrient_value("fiber", row.get("fiber")))
                     if row_pos < len(sub.index) - 1:
                         st.markdown(
                             "<div style='border-top:1px solid rgba(49,51,63,0.12); margin:0.15rem 0 0.35rem 0;'></div>",
@@ -1766,26 +2157,43 @@ with tabs[1]:
 
         preview_cal = 0.0
         preview_prot = 0.0
+        preview_fiber = None
         if edit_row["type"] == "food":
             frow = get_food_row(foods, edit_row["name"], edit_row["unit"])
             if frow is not None:
                 preview_cal = new_qty * as_float(frow["cal_per_unit"], 0.0)
                 preview_prot = new_qty * as_float(frow["protein_per_unit"], 0.0)
+                preview_fiber = (
+                    new_qty * as_float(frow["fiber_per_unit"], 0.0)
+                    if pd.notna(frow.get("fiber_per_unit"))
+                    else None
+                )
         elif edit_row["type"] == "dish":
-            base_c, base_p = compute_dish_base(
+            base_values = compute_dish_base(
                 edit_row["name"], dishes, dings, foods, edit_row["unit"]
             )
-            preview_cal = new_qty * base_c
-            preview_prot = new_qty * base_p
+            preview_cal = new_qty * as_float(base_values["calories"], 0.0)
+            preview_prot = new_qty * as_float(base_values["protein"], 0.0)
+            preview_fiber = (
+                new_qty * as_float(base_values["fiber"], 0.0)
+                if pd.notna(base_values["fiber"])
+                else None
+            )
         elif edit_row["type"] == "batch":
             batch_row = get_batch_row(batches, as_text(edit_row.get("batch_id")))
-            base_c, base_p = compute_batch_base(batch_row, edit_row["unit"])
-            preview_cal = new_qty * base_c
-            preview_prot = new_qty * base_p
+            base_values = compute_batch_base(batch_row, edit_row["unit"])
+            preview_cal = new_qty * as_float(base_values["calories"], 0.0)
+            preview_prot = new_qty * as_float(base_values["protein"], 0.0)
+            preview_fiber = (
+                new_qty * as_float(base_values["fiber"], 0.0)
+                if pd.notna(base_values["fiber"])
+                else None
+            )
 
-        edit_m1, edit_m2 = st.columns(2)
+        edit_m1, edit_m2, edit_m3 = st.columns(3)
         edit_m1.metric("Updated calories", f"{preview_cal:.0f}")
         edit_m2.metric("Updated protein (g)", f"{preview_prot:.1f}")
+        edit_m3.metric("Updated fiber (g)", format_nutrient_value("fiber", preview_fiber))
 
         if st.button("Save entry changes", key="save_day_log_edit_button"):
             if new_qty <= 0:
@@ -1796,6 +2204,7 @@ with tabs[1]:
                 logs.loc[edit_mask, "qty"] = new_qty
                 logs.loc[edit_mask, "calories"] = preview_cal
                 logs.loc[edit_mask, "protein"] = preview_prot
+                logs.loc[edit_mask, "fiber"] = preview_fiber
                 save_df(logs, LOGS_CSV)
                 clear_session_keys(
                     [
@@ -1873,27 +2282,35 @@ with tabs[2]:
 
     agg = (
         logs.groupby("date")
-        .agg(calories=("calories", "sum"), protein=("protein", "sum"))
+        .agg(calories=("calories", "sum"), protein=("protein", "sum"), fiber=("fiber", "sum"))
         .reset_index()
         if not logs.empty
-        else pd.DataFrame(columns=["date", "calories", "protein"])
+        else pd.DataFrame(columns=["date", "calories", "protein", "fiber"])
     )
-    goals_join = goals.rename(columns={"date": "date"})
-    merged = pd.merge(agg, goals_join, on="date", how="outer").sort_values("date")
-    month_rows = merged[merged["date"].astype(str).str.startswith(month_prefix)].copy()
+    month_days = pd.date_range(dashboard_month, month_last_day, freq="D")
+    month_rows = pd.DataFrame(
+        {"date": [day.date().isoformat() for day in month_days]}
+    )
+    month_rows = month_rows.merge(agg, on="date", how="left")
+    month_rows = apply_effective_goals(month_rows, goals, "date")
 
     if month_rows.empty:
         st.info("No logged entries or goals for this month yet.")
     else:
         month_rows["calories"] = pd.to_numeric(month_rows["calories"], errors="coerce").fillna(0.0)
         month_rows["protein"] = pd.to_numeric(month_rows["protein"], errors="coerce").fillna(0.0)
+        month_rows["fiber"] = pd.to_numeric(month_rows["fiber"], errors="coerce").fillna(0.0)
         month_rows["calorie_goal"] = pd.to_numeric(
             month_rows["calorie_goal"], errors="coerce"
         )
         month_rows["protein_goal"] = pd.to_numeric(
             month_rows["protein_goal"], errors="coerce"
         )
-        month_rows["has_log"] = (month_rows["calories"] > 0) | (month_rows["protein"] > 0)
+        month_rows["has_log"] = (
+            (month_rows["calories"] > 0)
+            | (month_rows["protein"] > 0)
+            | (month_rows["fiber"] > 0)
+        )
         month_rows["protein_met"] = (
             month_rows["protein"] >= month_rows["protein_goal"]
         ) & month_rows["protein_goal"].notna() & month_rows["has_log"]
@@ -1909,8 +2326,10 @@ with tabs[2]:
         logged_days = int(month_rows["has_log"].sum())
         month_total_calories = float(month_rows["calories"].sum())
         month_total_protein = float(month_rows["protein"].sum())
+        month_total_fiber = float(month_rows["fiber"].sum())
         month_avg_calories = month_total_calories / month_days_elapsed
         month_avg_protein = month_total_protein / month_days_elapsed
+        month_avg_fiber = month_total_fiber / month_days_elapsed
 
         week_rows = month_rows.copy()
         week_rows["parsed_date"] = week_rows["date"].apply(parse_date_value)
@@ -1921,8 +2340,10 @@ with tabs[2]:
         ].copy()
         week_total_calories = float(week_rows["calories"].sum()) if not week_rows.empty else 0.0
         week_total_protein = float(week_rows["protein"].sum()) if not week_rows.empty else 0.0
+        week_total_fiber = float(week_rows["fiber"].sum()) if not week_rows.empty else 0.0
         week_avg_calories = week_total_calories / week_days_elapsed
         week_avg_protein = week_total_protein / week_days_elapsed
+        week_avg_fiber = week_total_fiber / week_days_elapsed
         week_number = dashboard_anchor_day.isocalendar().week
 
         c1, c2, c3 = st.columns(3)
@@ -1933,11 +2354,12 @@ with tabs[2]:
         avg_m1, avg_m2 = st.columns(2)
         with avg_m1:
             st.markdown("#### Month-to-date daily average")
-            mavg1, mavg2 = st.columns(2)
+            mavg1, mavg2, mavg3 = st.columns(3)
             mavg1.metric("Calories", f"{month_avg_calories:.0f}")
             mavg2.metric("Protein (g)", f"{month_avg_protein:.1f}")
+            mavg3.metric("Fiber (g)", f"{month_avg_fiber:.1f}")
             st.caption(
-                f"Totals used: {month_total_calories:.0f} kcal and {month_total_protein:.1f}g protein. "
+                f"Totals used: {month_total_calories:.0f} kcal, {month_total_protein:.1f}g protein, and {month_total_fiber:.1f}g fiber. "
             )
             st.caption(
                 f"Using {month_days_elapsed} elapsed day{'s' if month_days_elapsed != 1 else ''} "
@@ -1945,11 +2367,12 @@ with tabs[2]:
             )
         with avg_m2:
             st.markdown(f"#### Week {week_number} daily average")
-            wavg1, wavg2 = st.columns(2)
+            wavg1, wavg2, wavg3 = st.columns(3)
             wavg1.metric("Calories", f"{week_avg_calories:.0f}")
             wavg2.metric("Protein (g)", f"{week_avg_protein:.1f}")
+            wavg3.metric("Fiber (g)", f"{week_avg_fiber:.1f}")
             st.caption(
-                f"Totals used: {week_total_calories:.0f} kcal and {week_total_protein:.1f}g protein. "
+                f"Totals used: {week_total_calories:.0f} kcal, {week_total_protein:.1f}g protein, and {week_total_fiber:.1f}g fiber. "
             )
             st.caption(
                 f"Monday-start week, using {week_days_elapsed} elapsed day{'s' if week_days_elapsed != 1 else ''} "
@@ -1992,6 +2415,7 @@ with tabs[2]:
                     "calorie_goal",
                     "calorie_ok",
                     "protein",
+                    "fiber",
                     "protein_goal",
                     "protein_met",
                 ]
@@ -2012,9 +2436,9 @@ with tabs[3]:
     )
     with st.expander("Add food"):
         st.caption(
-            "Create a reusable food definition. Example: Rice, unit g, base quantity 100, calories 130, protein 2.7."
+            "Create a reusable food definition. Example: Rice, unit g, base quantity 100, calories 130, protein 2.7, fiber 0.4."
         )
-        c1, c2, c3, c4 = st.columns(4)
+        c1, c2, c3, c4, c5 = st.columns(5)
         with c1:
             f_name = st.text_input("Food name", key="add_food_name")
         with c2:
@@ -2024,6 +2448,8 @@ with tabs[3]:
             cal_base = st.number_input("Calories for base qty", min_value=0.0, step=1.0, key="add_cal_base")
         with c4:
             prot_base = st.number_input("Protein for base qty (g)", min_value=0.0, step=0.1, key="add_prot_base")
+        with c5:
+            fiber_base_text = st.text_input("Fiber for base qty (g)", key="add_fiber_base")
 
         b1, b2 = st.columns(2)
         with b1:
@@ -2035,12 +2461,24 @@ with tabs[3]:
             f_name = f_name.strip()
             unit = unit.strip()
             if f_name and unit:
+                if not fiber_base_text.strip():
+                    st.error("Fiber for base quantity is required. Use 0 if needed.")
+                    st.stop()
+                try:
+                    fiber_base = float(fiber_base_text.strip())
+                except ValueError:
+                    st.error("Fiber for base quantity must be a number.")
+                    st.stop()
+                if fiber_base < 0:
+                    st.error("Fiber for base quantity cannot be negative.")
+                    st.stop()
                 exists = (foods["food_name"] == f_name) & (foods["unit"] == unit)
                 if exists.any():
                     st.warning("Food with this unit already exists.")
                 else:
                     cal_per = cal_base / base_qty if base_qty > 0 else 0
                     prot_per = prot_base / base_qty if base_qty > 0 else 0
+                    fiber_per = fiber_base / base_qty if base_qty > 0 else 0
 
                     foods.loc[len(foods)] = [
                         f_name,
@@ -2048,8 +2486,10 @@ with tabs[3]:
                         base_qty,
                         cal_base,
                         prot_base,
+                        fiber_base,
                         cal_per,
                         prot_per,
+                        fiber_per,
                     ]
                     save_df(foods, FOODS_CSV)
                     clear_add_food_form()
@@ -2066,6 +2506,88 @@ with tabs[3]:
             foods.assign(key=foods.apply(food_key, axis=1)), use_container_width=True
         )
 
+    with st.expander("Bulk edit food nutrients", expanded=False):
+        st.caption(
+            "Fastest way to backfill fiber for many foods. Edit the table and save once. Existing calorie/protein values are preloaded."
+        )
+        bulk_cols = [
+            "food_name",
+            "unit",
+            "base_qty",
+            "calories_base",
+            "protein_base",
+            "fiber_base",
+        ]
+        bulk_foods = foods[bulk_cols].copy().reset_index(names="source_index")
+        bulk_foods["base_qty"] = pd.to_numeric(bulk_foods["base_qty"], errors="coerce").fillna(1.0)
+        bulk_foods["calories_base"] = pd.to_numeric(
+            bulk_foods["calories_base"], errors="coerce"
+        ).fillna(0.0)
+        bulk_foods["protein_base"] = pd.to_numeric(
+            bulk_foods["protein_base"], errors="coerce"
+        ).fillna(0.0)
+        bulk_foods["fiber_base"] = pd.to_numeric(
+            bulk_foods["fiber_base"], errors="coerce"
+        )
+        edited_bulk = st.data_editor(
+            bulk_foods,
+            hide_index=True,
+            use_container_width=True,
+            num_rows="fixed",
+            disabled=["source_index", "food_name", "unit"],
+            column_config={
+                "source_index": None,
+                "food_name": st.column_config.TextColumn("Food"),
+                "unit": st.column_config.TextColumn("Unit"),
+                "base_qty": st.column_config.NumberColumn("Base qty", min_value=1.0, step=1.0, required=True),
+                "calories_base": st.column_config.NumberColumn("Calories", min_value=0.0, step=1.0, required=True),
+                "protein_base": st.column_config.NumberColumn("Protein (g)", min_value=0.0, step=0.1, required=True),
+                "fiber_base": st.column_config.NumberColumn("Fiber (g)", min_value=0.0, step=0.1, required=True),
+            },
+            key="bulk_food_nutrient_editor",
+        )
+        if st.button("Save bulk food updates", key="save_bulk_food_updates"):
+            updated_foods = foods.copy()
+            impacted_food_refs = []
+            for _, row in edited_bulk.iterrows():
+                source_index = int(row["source_index"])
+                updated_foods.loc[source_index, "base_qty"] = as_float(row["base_qty"], 1.0)
+                updated_foods.loc[source_index, "calories_base"] = as_float(row["calories_base"], 0.0)
+                updated_foods.loc[source_index, "protein_base"] = as_float(row["protein_base"], 0.0)
+                updated_foods.loc[source_index, "fiber_base"] = (
+                    as_float(row["fiber_base"], 0.0)
+                    if pd.notna(row["fiber_base"])
+                    else None
+                )
+                impacted_food_refs.append(
+                    (
+                        as_text(updated_foods.loc[source_index, "food_name"]),
+                        as_text(updated_foods.loc[source_index, "unit"]),
+                    )
+                )
+
+            updated_foods = updated_foods.apply(normalize_food_row, axis=1)
+            foods = updated_foods
+            save_df(foods, FOODS_CSV)
+
+            for food_name_value, unit_value in impacted_food_refs:
+                logs = recalc_logs_for_food(logs, foods, food_name_value, unit_value)
+
+            impacted_dishes = sorted(
+                dings[
+                    dings["ingredient_food_name"].isin([name for name, _ in impacted_food_refs])
+                ]["dish_name"].unique().tolist()
+            )
+            if impacted_dishes:
+                logs = recalc_logs_for_dishes(logs, dishes, dings, foods, impacted_dishes)
+            batches, logs = recalc_batches_for_food_refs(
+                batches, batch_ings, logs, foods, impacted_food_refs
+            )
+            save_df(batches, BATCHES_CSV)
+            save_df(logs, LOGS_CSV)
+            st.session_state.master_data_message = "Bulk food nutrient updates saved."
+            st.rerun()
+
     if not foods.empty:
         section_heading(
             "Edit a food",
@@ -2080,13 +2602,7 @@ with tabs[3]:
             frow = foods[foods.apply(food_key, axis=1) == fedit].iloc[0]
             old_name, old_unit = frow["food_name"], frow["unit"]
             if st.session_state.get("edit_food_loaded_for") != fedit:
-                st.session_state.edit_food_name = old_name
-                st.session_state.edit_food_unit = old_unit
-                st.session_state.edit_base_qty = float(frow["base_qty"])
-                st.session_state.edit_cal_base = float(frow["calories_base"])
-                st.session_state.edit_prot_base = float(frow["protein_base"])
-                st.session_state.edit_food_propagate = True
-                st.session_state.edit_food_loaded_for = fedit
+                load_food_into_edit_form(frow, fedit)
 
             new_name = st.text_input("Food name", key="edit_food_name")
             new_unit = st.text_input("Unit", key="edit_food_unit")
@@ -2110,6 +2626,10 @@ with tabs[3]:
                 step=0.1,
                 key="edit_prot_base",
             )
+            new_fiber_base_text = st.text_input(
+                "Fiber for base qty (g)",
+                key="edit_fiber_base",
+            )
             propagate = st.checkbox(
                 "Also update dish ingredients that reference this food",
                 key="edit_food_propagate",
@@ -2123,73 +2643,96 @@ with tabs[3]:
                     & (foods["food_name"] == new_name)
                     & (foods["unit"] == new_unit)
                 )
+                validation_error = None
+                new_fiber_base = None
                 if not new_name or not new_unit:
-                    st.error("Name and unit required.")
-                    st.stop()
-                if duplicate.any():
-                    st.error("Another food already uses this name and unit.")
-                    st.stop()
+                    validation_error = "Name and unit required."
+                elif duplicate.any():
+                    validation_error = "Another food already uses this name and unit."
+                elif not new_fiber_base_text.strip():
+                    validation_error = "Fiber for base quantity is required. Use 0 if needed."
+                else:
+                    try:
+                        new_fiber_base = float(new_fiber_base_text.strip())
+                    except ValueError:
+                        validation_error = "Fiber for base quantity must be a number."
+                if validation_error is None and new_fiber_base is not None and new_fiber_base < 0:
+                    validation_error = "Fiber for base quantity cannot be negative."
+                if validation_error:
+                    st.error(validation_error)
+                else:
 
-                impacted_before = sorted(
-                    dings[
-                        (dings["ingredient_food_name"] == old_name)
-                        & (dings["ingredient_unit"] == old_unit)
-                    ]["dish_name"]
-                    .unique()
-                    .tolist()
-                )
-
-                # update foods table
-                cal_per = new_cal_base / new_base_qty if new_base_qty > 0 else 0
-                prot_per = new_prot_base / new_base_qty if new_base_qty > 0 else 0
-
-                foods.loc[frow.name] = [
-                    new_name,
-                    new_unit,
-                    new_base_qty,
-                    new_cal_base,
-                    new_prot_base,
-                    cal_per,
-                    prot_per,
-                ]
-                save_df(foods, FOODS_CSV)
-
-                # If name/unit changed, update existing food logs to new identifiers
-                if new_name != old_name or new_unit != old_unit:
-                    mask_logs = (
-                        (logs["type"] == "food")
-                        & (logs["name"] == old_name)
-                        & (logs["unit"] == old_unit)
+                    impacted_before = sorted(
+                        dings[
+                            (dings["ingredient_food_name"] == old_name)
+                            & (dings["ingredient_unit"] == old_unit)
+                        ]["dish_name"]
+                        .unique()
+                        .tolist()
                     )
-                    logs.loc[mask_logs, ["name", "unit"]] = [new_name, new_unit]
 
-                # Optionally propagate to dish ingredients
-                if propagate and (new_name != old_name or new_unit != old_unit):
-                    mask = (dings["ingredient_food_name"] == old_name) & (
-                        dings["ingredient_unit"] == old_unit
+                    # update foods table
+                    cal_per = new_cal_base / new_base_qty if new_base_qty > 0 else 0
+                    prot_per = new_prot_base / new_base_qty if new_base_qty > 0 else 0
+                    fiber_per = new_fiber_base / new_base_qty if new_base_qty > 0 else 0
+
+                    foods.loc[frow.name] = [
+                        new_name,
+                        new_unit,
+                        new_base_qty,
+                        new_cal_base,
+                        new_prot_base,
+                        new_fiber_base,
+                        cal_per,
+                        prot_per,
+                        fiber_per,
+                    ]
+                    save_df(foods, FOODS_CSV)
+
+                    # If name/unit changed, update existing food logs to new identifiers
+                    if new_name != old_name or new_unit != old_unit:
+                        mask_logs = (
+                            (logs["type"] == "food")
+                            & (logs["name"] == old_name)
+                            & (logs["unit"] == old_unit)
+                        )
+                        logs.loc[mask_logs, ["name", "unit"]] = [new_name, new_unit]
+
+                    # Optionally propagate to dish ingredients
+                    if propagate and (new_name != old_name or new_unit != old_unit):
+                        mask = (dings["ingredient_food_name"] == old_name) & (
+                            dings["ingredient_unit"] == old_unit
+                        )
+                        dings.loc[mask, "ingredient_food_name"] = new_name
+                        dings.loc[mask, "ingredient_unit"] = new_unit
+                        save_df(dings, DISH_ING_CSV)
+                        st.success("References updated.")
+
+                    # Recalculate logs that reference this food and any dishes that include it
+                    logs = recalc_logs_for_food(logs, foods, new_name, new_unit)
+                    impacted_after = sorted(
+                        dings[
+                            (dings["ingredient_food_name"] == new_name)
+                            & (dings["ingredient_unit"] == new_unit)
+                        ]["dish_name"]
+                        .unique()
+                        .tolist()
                     )
-                    dings.loc[mask, "ingredient_food_name"] = new_name
-                    dings.loc[mask, "ingredient_unit"] = new_unit
-                    save_df(dings, DISH_ING_CSV)
-                    st.success("References updated.")
+                    impacted = sorted(set(impacted_before) | set(impacted_after))
+                    if impacted:
+                        logs = recalc_logs_for_dishes(logs, dishes, dings, foods, impacted)
+                    batches, logs = recalc_batches_for_food_refs(
+                        batches,
+                        batch_ings,
+                        logs,
+                        foods,
+                        [(new_name, new_unit)],
+                    )
+                    save_df(batches, BATCHES_CSV)
+                    save_df(logs, LOGS_CSV)
 
-                # Recalculate logs that reference this food and any dishes that include it
-                logs = recalc_logs_for_food(logs, foods, new_name, new_unit)
-                impacted_after = sorted(
-                    dings[
-                        (dings["ingredient_food_name"] == new_name)
-                        & (dings["ingredient_unit"] == new_unit)
-                    ]["dish_name"]
-                    .unique()
-                    .tolist()
-                )
-                impacted = sorted(set(impacted_before) | set(impacted_after))
-                if impacted:
-                    logs = recalc_logs_for_dishes(logs, dishes, dings, foods, impacted)
-                save_df(logs, LOGS_CSV)
-
-                st.success(f"Food {fedit} updated and logs recalculated.")
-                st.rerun()
+                    st.success(f"Food {fedit} updated and logs recalculated.")
+                    st.rerun()
 
     if not foods.empty:
         section_heading(
@@ -2249,13 +2792,13 @@ with tabs[3]:
     )
     with st.expander("Add / update dish"):
         st.caption(
-            "Use this to create or update a dish shell. Example override: Tea = 70 kcal and 2g protein per serving. Example ingredient dish: Dal with final dish quantity 850 and unit g, then add ingredients below."
+            "Use this to create or update a dish shell. Example override: Tea = 70 kcal, 2g protein, and 0g fiber per serving. Example ingredient dish: Dal with final dish quantity 850 and unit g, then add ingredients below."
         )
         dname = st.text_input("Dish name", key="add_dish_name")
         use_override = st.checkbox(
             "Use manual override values", key="add_dish_override"
         )
-        col1, col2, col3, col4 = st.columns(4)
+        col1, col2, col3, col4, col5 = st.columns(5)
         with col1:
             cal_o = st.number_input(
                 "Calories per serving",
@@ -2275,6 +2818,12 @@ with tabs[3]:
                 key="add_dish_prot",
             )
         with col3:
+            fiber_o_text = st.text_input(
+                "Fiber per serving (g)",
+                disabled=not use_override,
+                key="add_dish_fiber",
+            )
+        with col4:
             servings = st.number_input(
                 "Servings definition",
                 min_value=1.0,
@@ -2283,7 +2832,7 @@ with tabs[3]:
                 help="Use 1 unless you need a different base serving size.",
                 key="add_dish_servings",
             )
-        with col4:
+        with col5:
             yield_qty = st.number_input(
                 "Final dish quantity",
                 min_value=0.0,
@@ -2313,9 +2862,20 @@ with tabs[3]:
             elif not use_override and yield_qty > 0 and not yield_unit:
                 st.error("Final dish unit is required when final dish quantity is set.")
             else:
+                if use_override and not fiber_o_text.strip():
+                    st.error("Fiber per serving is required for override dishes. Use 0 if needed.")
+                    st.stop()
+                fiberv = None
+                if use_override:
+                    try:
+                        fiberv = float(fiber_o_text.strip())
+                    except ValueError:
+                        st.error("Fiber per serving must be a number.")
+                        st.stop()
                 exists = dishes["dish_name"] == dname
                 calv = cal_o if use_override else None
                 protv = prot_o if use_override else None
+                fiberv = fiberv if use_override else None
                 yieldv = yield_qty if not use_override and yield_qty > 0 else None
                 yield_unitv = yield_unit if yieldv is not None else None
                 if exists.any():
@@ -2325,16 +2885,18 @@ with tabs[3]:
                         [
                             "cal_override",
                             "protein_override",
+                            "fiber_override",
                             "servings",
                             "yield_qty",
                             "yield_unit",
                         ],
-                    ] = [calv, protv, servings, yieldv, yield_unitv]
+                    ] = [calv, protv, fiberv, servings, yieldv, yield_unitv]
                 else:
                     dishes.loc[len(dishes)] = [
                         dname,
                         calv,
                         protv,
+                        fiberv,
                         servings,
                         yieldv,
                         yield_unitv,
@@ -2421,7 +2983,7 @@ with tabs[3]:
             drow = dishes[dishes["dish_name"] == dsel_edit].iloc[0]
             edit_use_override = st.checkbox(
                 "Use manual override values",
-                value=pd.notna(drow["cal_override"]) and pd.notna(drow["protein_override"]),
+                value=is_override_dish(drow),
                 key="edit_dish_override_unique",
             )
 
@@ -2444,6 +3006,12 @@ with tabs[3]:
                 else 0.0,
                 disabled=not edit_use_override,
                 key="edit_dish_prot_unique",
+            )
+            new_fiber_text = st.text_input(
+                "Fiber per serving (g)",
+                value="" if pd.isna(drow["fiber_override"]) else format_nutrient_value("fiber", drow["fiber_override"]),
+                disabled=not edit_use_override,
+                key="edit_dish_fiber_unique",
             )
             new_serv = st.number_input(
                 "Servings definition",
@@ -2474,6 +3042,16 @@ with tabs[3]:
                 if not edit_use_override and edit_yield_qty > 0 and not edit_yield_unit:
                     st.error("Final dish unit is required when final dish quantity is set.")
                 else:
+                    new_fiber = None
+                    if edit_use_override:
+                        if not new_fiber_text.strip():
+                            st.error("Fiber per serving is required for override dishes. Use 0 if needed.")
+                            st.stop()
+                        try:
+                            new_fiber = float(new_fiber_text.strip())
+                        except ValueError:
+                            st.error("Fiber per serving must be a number.")
+                            st.stop()
                     yieldv = edit_yield_qty if not edit_use_override and edit_yield_qty > 0 else None
                     yield_unitv = edit_yield_unit if yieldv is not None else None
                     idx = drow.name
@@ -2482,6 +3060,7 @@ with tabs[3]:
                         [
                             "cal_override",
                             "protein_override",
+                            "fiber_override",
                             "servings",
                             "yield_qty",
                             "yield_unit",
@@ -2489,6 +3068,7 @@ with tabs[3]:
                     ] = [
                         new_cal if edit_use_override else None,
                         new_prot if edit_use_override else None,
+                        new_fiber if edit_use_override else None,
                         new_serv,
                         yieldv,
                         yield_unitv,
@@ -2638,8 +3218,14 @@ with tabs[3]:
                         "servings": round(metrics["servings"], 2),
                         "total_calories": round(metrics["total_calories"], 2),
                         "total_protein": round(metrics["total_protein"], 2),
+                        "total_fiber": round(as_float(metrics["total_fiber"], 0.0), 2)
+                        if pd.notna(metrics["total_fiber"])
+                        else None,
                         "calories_per_serving": round(metrics["per_serving_calories"], 2),
                         "protein_per_serving": round(metrics["per_serving_protein"], 2),
+                        "fiber_per_serving": round(as_float(metrics["per_serving_fiber"], 0.0), 2)
+                        if pd.notna(metrics["per_serving_fiber"])
+                        else None,
                         "final_qty": round(metrics["final_qty"], 2)
                         if metrics["has_weight_basis"]
                         else None,
@@ -2650,6 +3236,9 @@ with tabs[3]:
                         else None,
                         "protein_per_final_unit": round(metrics["per_weight_protein"], 4)
                         if metrics["has_weight_basis"]
+                        else None,
+                        "fiber_per_final_unit": round(as_float(metrics["per_weight_fiber"], 0.0), 4)
+                        if metrics["has_weight_basis"] and pd.notna(metrics["per_weight_fiber"])
                         else None,
                     }
                 )
@@ -2803,7 +3392,14 @@ with tabs[3]:
                         else:
                             est_c = qty_value * as_float(frow["cal_per_unit"], 0.0)
                             est_p = qty_value * as_float(frow["protein_per_unit"], 0.0)
-                            st.caption(f"{est_c:.0f} kcal | {est_p:.1f}g")
+                            est_f = (
+                                qty_value * as_float(frow["fiber_per_unit"], 0.0)
+                                if pd.notna(frow.get("fiber_per_unit"))
+                                else None
+                            )
+                            st.caption(
+                                f"{est_c:.0f} kcal | {est_p:.1f}g protein | {format_nutrient_value('fiber', est_f, with_unit=True)} fiber"
+                            )
                     with c5:
                         if st.button("Remove", key=f"{row_state_key}_{row_id}_remove"):
                             remove_row_id = row_id
@@ -2832,18 +3428,25 @@ with tabs[3]:
 
             preview_metrics = None
             if is_override_dish(template_row):
-                total_c = as_float(template_row["cal_override"], 0.0) * batch_servings
-                total_p = as_float(template_row["protein_override"], 0.0) * batch_servings
+                nutrient_totals = {}
+                missing_nutrients = []
+                for spec in TRACKED_NUTRIENTS:
+                    override_value = template_row.get(spec["dish_override_col"])
+                    if pd.isna(override_value):
+                        nutrient_totals[spec["key"]] = None
+                        missing_nutrients.append(spec["key"])
+                    else:
+                        nutrient_totals[spec["key"]] = as_float(override_value, 0.0) * batch_servings
                 preview_metrics = build_portion_metrics(
                     batch_servings,
-                    total_c,
-                    total_p,
+                    nutrient_totals,
                     batch_final_qty if batch_final_qty > 0 else 0.0,
                     batch_final_unit.strip(),
+                    missing_nutrients=missing_nutrients,
                 )
             elif batch_ingredient_rows:
                 batch_ingredients_df = pd.DataFrame(batch_ingredient_rows)
-                total_c, total_p = compute_ingredient_totals(
+                nutrient_totals, missing_nutrients = compute_ingredient_totals(
                     batch_ingredients_df, foods, "ingredient_qty"
                 )
                 auto_qty, auto_unit = get_auto_yield_from_ingredients(
@@ -2851,29 +3454,32 @@ with tabs[3]:
                 )
                 preview_metrics = build_portion_metrics(
                     batch_servings,
-                    total_c,
-                    total_p,
+                    nutrient_totals,
                     batch_final_qty if batch_final_qty > 0 else 0.0,
                     batch_final_unit.strip(),
                     auto_qty,
                     auto_unit,
+                    missing_nutrients,
                 )
 
             if preview_metrics is not None:
-                p1, p2, p3 = st.columns(3)
+                p1, p2, p3, p4 = st.columns(4)
                 p1.metric("Batch calories", f"{preview_metrics['total_calories']:.0f}")
                 p2.metric("Batch protein (g)", f"{preview_metrics['total_protein']:.1f}")
+                p3.metric("Batch fiber (g)", format_nutrient_value("fiber", preview_metrics["total_fiber"]))
                 source_label = preview_metrics["yield_source"] or "none"
-                p3.metric("Final qty source", source_label)
+                p4.metric("Final qty source", source_label)
                 st.caption(
                     f"Per serving: {preview_metrics['per_serving_calories']:.1f} kcal, "
-                    f"{preview_metrics['per_serving_protein']:.2f}g protein."
+                    f"{preview_metrics['per_serving_protein']:.2f}g protein, "
+                    f"{format_nutrient_value('fiber', preview_metrics['per_serving_fiber'], with_unit=True)} fiber."
                 )
                 if preview_metrics["has_weight_basis"]:
                     st.caption(
                         f"Per {preview_metrics['final_unit']}: "
                         f"{preview_metrics['per_weight_calories']:.3f} kcal, "
-                        f"{preview_metrics['per_weight_protein']:.4f}g protein."
+                        f"{preview_metrics['per_weight_protein']:.4f}g protein, "
+                        f"{format_nutrient_value('fiber', preview_metrics['per_weight_fiber'], with_unit=True)} fiber."
                     )
 
             c1, c2 = st.columns(2)
@@ -2895,7 +3501,12 @@ with tabs[3]:
                 else:
                     batch_id = make_batch_id(batch_day)
                     if preview_metrics is None:
-                        preview_metrics = build_portion_metrics(batch_servings, 0.0, 0.0, 0.0, "")
+                        preview_metrics = build_portion_metrics(
+                            batch_servings,
+                            {spec["key"]: 0.0 for spec in TRACKED_NUTRIENTS},
+                            0.0,
+                            "",
+                        )
 
                     batches.loc[len(batches)] = [
                         batch_id,
@@ -2907,6 +3518,7 @@ with tabs[3]:
                         preview_metrics["yield_source"],
                         preview_metrics["total_calories"],
                         preview_metrics["total_protein"],
+                        preview_metrics["total_fiber"],
                         batch_notes.strip(),
                     ]
 
@@ -2944,6 +3556,13 @@ with tabs[3]:
                 / max(as_float(row["servings"], 1.0), 1.0),
                 axis=1,
             )
+            preview["fiber_per_serving"] = preview.apply(
+                lambda row: as_float(row["total_fiber"], 0.0)
+                / max(as_float(row["servings"], 1.0), 1.0)
+                if pd.notna(row["total_fiber"])
+                else None,
+                axis=1,
+            )
             preview["calories_per_final_unit"] = preview.apply(
                 lambda row: as_float(row["total_calories"], 0.0) / as_float(row["final_qty"], 0.0)
                 if as_float(row["final_qty"], 0.0) > 0 and as_text(row["final_unit"])
@@ -2953,6 +3572,14 @@ with tabs[3]:
             preview["protein_per_final_unit"] = preview.apply(
                 lambda row: as_float(row["total_protein"], 0.0) / as_float(row["final_qty"], 0.0)
                 if as_float(row["final_qty"], 0.0) > 0 and as_text(row["final_unit"])
+                else None,
+                axis=1,
+            )
+            preview["fiber_per_final_unit"] = preview.apply(
+                lambda row: as_float(row["total_fiber"], 0.0) / as_float(row["final_qty"], 0.0)
+                if pd.notna(row["total_fiber"])
+                and as_float(row["final_qty"], 0.0) > 0
+                and as_text(row["final_unit"])
                 else None,
                 axis=1,
             )
@@ -2968,10 +3595,13 @@ with tabs[3]:
                         "yield_source",
                         "total_calories",
                         "total_protein",
+                        "total_fiber",
                         "calories_per_serving",
                         "protein_per_serving",
+                        "fiber_per_serving",
                         "calories_per_final_unit",
                         "protein_per_final_unit",
+                        "fiber_per_final_unit",
                         "notes",
                     ]
                 ],
@@ -3145,7 +3775,14 @@ with tabs[3]:
                         else:
                             est_c = qty_value * as_float(frow["cal_per_unit"], 0.0)
                             est_p = qty_value * as_float(frow["protein_per_unit"], 0.0)
-                            st.caption(f"{est_c:.0f} kcal | {est_p:.1f}g")
+                            est_f = (
+                                qty_value * as_float(frow["fiber_per_unit"], 0.0)
+                                if pd.notna(frow.get("fiber_per_unit"))
+                                else None
+                            )
+                            st.caption(
+                                f"{est_c:.0f} kcal | {est_p:.1f}g protein | {format_nutrient_value('fiber', est_f, with_unit=True)} fiber"
+                            )
                     with c5:
                         if st.button("Remove", key=f"{row_state_key}_{row_id}_remove"):
                             remove_row_id = row_id
@@ -3174,18 +3811,25 @@ with tabs[3]:
 
             edit_preview_metrics = None
             if template_row is not None and is_override_dish(template_row) and not edit_batch_ingredient_rows:
-                total_c = as_float(template_row["cal_override"], 0.0) * edit_servings
-                total_p = as_float(template_row["protein_override"], 0.0) * edit_servings
+                nutrient_totals = {}
+                missing_nutrients = []
+                for spec in TRACKED_NUTRIENTS:
+                    override_value = template_row.get(spec["dish_override_col"])
+                    if pd.isna(override_value):
+                        nutrient_totals[spec["key"]] = None
+                        missing_nutrients.append(spec["key"])
+                    else:
+                        nutrient_totals[spec["key"]] = as_float(override_value, 0.0) * edit_servings
                 edit_preview_metrics = build_portion_metrics(
                     edit_servings,
-                    total_c,
-                    total_p,
+                    nutrient_totals,
                     edit_final_qty if edit_final_qty > 0 else 0.0,
                     edit_final_unit.strip(),
+                    missing_nutrients=missing_nutrients,
                 )
             elif edit_batch_ingredient_rows:
                 edit_batch_ingredients_df = pd.DataFrame(edit_batch_ingredient_rows)
-                total_c, total_p = compute_ingredient_totals(
+                nutrient_totals, missing_nutrients = compute_ingredient_totals(
                     edit_batch_ingredients_df, foods, "ingredient_qty"
                 )
                 auto_qty, auto_unit = get_auto_yield_from_ingredients(
@@ -3193,28 +3837,31 @@ with tabs[3]:
                 )
                 edit_preview_metrics = build_portion_metrics(
                     edit_servings,
-                    total_c,
-                    total_p,
+                    nutrient_totals,
                     edit_final_qty if edit_final_qty > 0 else 0.0,
                     edit_final_unit.strip(),
                     auto_qty,
                     auto_unit,
+                    missing_nutrients,
                 )
 
             if edit_preview_metrics is not None:
-                p1, p2, p3 = st.columns(3)
+                p1, p2, p3, p4 = st.columns(4)
                 p1.metric("Batch calories", f"{edit_preview_metrics['total_calories']:.0f}")
                 p2.metric("Batch protein (g)", f"{edit_preview_metrics['total_protein']:.1f}")
-                p3.metric("Final qty source", edit_preview_metrics["yield_source"] or "none")
+                p3.metric("Batch fiber (g)", format_nutrient_value("fiber", edit_preview_metrics["total_fiber"]))
+                p4.metric("Final qty source", edit_preview_metrics["yield_source"] or "none")
                 st.caption(
                     f"Per serving: {edit_preview_metrics['per_serving_calories']:.1f} kcal, "
-                    f"{edit_preview_metrics['per_serving_protein']:.2f}g protein."
+                    f"{edit_preview_metrics['per_serving_protein']:.2f}g protein, "
+                    f"{format_nutrient_value('fiber', edit_preview_metrics['per_serving_fiber'], with_unit=True)} fiber."
                 )
                 if edit_preview_metrics["has_weight_basis"]:
                     st.caption(
                         f"Per {edit_preview_metrics['final_unit']}: "
                         f"{edit_preview_metrics['per_weight_calories']:.3f} kcal, "
-                        f"{edit_preview_metrics['per_weight_protein']:.4f}g protein."
+                        f"{edit_preview_metrics['per_weight_protein']:.4f}g protein, "
+                        f"{format_nutrient_value('fiber', edit_preview_metrics['per_weight_fiber'], with_unit=True)} fiber."
                     )
 
             if st.button("Save batch changes", key="save_batch_edit"):
@@ -3228,7 +3875,10 @@ with tabs[3]:
                 else:
                     if edit_preview_metrics is None:
                         edit_preview_metrics = build_portion_metrics(
-                            edit_servings, 0.0, 0.0, 0.0, ""
+                            edit_servings,
+                            {spec["key"]: 0.0 for spec in TRACKED_NUTRIENTS},
+                            0.0,
+                            "",
                         )
 
                     new_batch_id = (
@@ -3249,6 +3899,7 @@ with tabs[3]:
                     batches.loc[batch_index, "yield_source"] = edit_preview_metrics["yield_source"]
                     batches.loc[batch_index, "total_calories"] = edit_preview_metrics["total_calories"]
                     batches.loc[batch_index, "total_protein"] = edit_preview_metrics["total_protein"]
+                    batches.loc[batch_index, "total_fiber"] = edit_preview_metrics["total_fiber"]
                     batches.loc[batch_index, "notes"] = edit_notes.strip()
 
                     logs.loc[
@@ -3357,13 +4008,13 @@ with tabs[3]:
 
     section_heading(
         "Goals",
-        "Goals are date-specific. Use single-date goals for one day, or bulk goals to prefill a date range. Past-date edits require the Day View toggle.",
+        "Goals carry forward from their saved date until you change them again. Use a single-date save to start a new target from that day, or bulk goals to prefill a date range. Past-date edits require the Day View toggle.",
         level=3,
     )
 
     with st.expander("Set or update goal for a single date"):
         st.caption(
-            "Set one day's targets. Example: May 3 has 1800 kcal and 120g protein; changing May 3 does not change other days."
+            "Set new targets starting on one day. Example: save 1800 kcal and 120g protein on May 3, and those targets stay active until a later goal row changes them."
         )
         day = st.date_input(
             "Date for goal",

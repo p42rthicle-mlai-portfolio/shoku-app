@@ -1147,7 +1147,7 @@ def collapsible_panel(title: str, panel_key: str, default_open: bool = False):
     label = f"{'▼' if is_open else '▶'} {title}"
     if st.button(label, key=f"{state_key}_toggle", use_container_width=True):
         st.session_state[state_key] = not is_open
-        is_open = bool(st.session_state[state_key])
+        st.rerun()
     if is_open:
         with st.container(border=True):
             yield True

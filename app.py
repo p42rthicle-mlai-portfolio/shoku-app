@@ -127,9 +127,11 @@ DISH_COLUMNS = [
 ]
 DISH_INGREDIENT_COLUMNS = [
     "dish_name",
+    "ingredient_type",
     "ingredient_food_name",
     "ingredient_unit",
     "ingredient_qty_per_serving",
+    "ingredient_batch_id",
 ]
 GOAL_COLUMNS = ["date", "calorie_goal", "protein_goal"]
 LOG_COLUMNS = [
@@ -161,9 +163,11 @@ BATCH_COLUMNS = [
 ]
 BATCH_INGREDIENT_COLUMNS = [
     "batch_id",
+    "ingredient_type",
     "ingredient_food_name",
     "ingredient_unit",
     "ingredient_qty",
+    "ingredient_batch_id",
 ]
 DATE_INPUT_FORMAT = "DD/MM/YYYY"
 MEAL_OPTIONS = ["Breakfast", "Lunch", "Snacks", "Dinner"]
@@ -433,6 +437,11 @@ def as_text(value) -> str:
     if pd.isna(value):
         return ""
     return str(value).strip()
+
+
+def ingredient_type_for_row(row) -> str:
+    ingredient_type = as_text(row.get("ingredient_type")).lower()
+    return ingredient_type if ingredient_type in {"food", "batch"} else "food"
 
 
 def format_nutrient_value(nutrient_key: str, value, with_unit: bool = False) -> str:
@@ -714,6 +723,25 @@ def batch_key(row) -> str:
     )
 
 
+def batch_ref_label(batch_row) -> str:
+    if batch_row is None:
+        return "Missing batch"
+    return batch_key(batch_row)
+
+
+def ingredient_ref_label(row, batches: pd.DataFrame | None = None) -> str:
+    if ingredient_type_for_row(row) == "batch":
+        batch_id = as_text(row.get("ingredient_batch_id"))
+        batch_row = get_batch_row(batches, batch_id) if batches is not None and batch_id else None
+        label = batch_ref_label(batch_row) if batch_row is not None else (
+            f"{as_text(row.get('ingredient_food_name'))} [{short_batch_id(batch_id)}]"
+            if batch_id
+            else "Missing batch"
+        )
+        return f"Batch: {label}"
+    return f"{as_text(row.get('ingredient_food_name'))} [{as_text(row.get('ingredient_unit'))}]"
+
+
 def get_food_row(foods: pd.DataFrame, food_name: str, unit: str):
     m = (foods["food_name"] == food_name) & (foods["unit"] == unit)
     if not m.any():
@@ -722,15 +750,40 @@ def get_food_row(foods: pd.DataFrame, food_name: str, unit: str):
 
 
 def compute_ingredient_totals(
-    ingredients: pd.DataFrame, foods: pd.DataFrame, qty_column: str
+    ingredients: pd.DataFrame, foods: pd.DataFrame, batches: pd.DataFrame, qty_column: str
 ):
     totals = {spec["key"]: 0.0 for spec in TRACKED_NUTRIENTS}
     missing_nutrients = set()
     for _, ing in ingredients.iterrows():
+        ingredient_type = ingredient_type_for_row(ing)
+        qty = as_float(ing[qty_column], 0.0)
+        if ingredient_type == "batch":
+            batch_id = as_text(ing.get("ingredient_batch_id"))
+            batch_row = get_batch_row(batches, batch_id) if batch_id else None
+            if batch_row is None:
+                missing_nutrients.update(spec["key"] for spec in TRACKED_NUTRIENTS)
+                continue
+            unit = as_text(ing.get("ingredient_unit"))
+            batch_metrics = get_batch_metrics(batch_row)
+            valid_unit = unit == "serving" or (
+                batch_metrics["has_weight_basis"] and unit == batch_metrics["final_unit"]
+            )
+            if not valid_unit:
+                missing_nutrients.update(spec["key"] for spec in TRACKED_NUTRIENTS)
+                continue
+            base_values = compute_batch_base(batch_row, unit)
+            for spec in TRACKED_NUTRIENTS:
+                per_unit_value = base_values.get(spec["key"])
+                if pd.isna(per_unit_value):
+                    missing_nutrients.add(spec["key"])
+                else:
+                    totals[spec["key"]] += qty * as_float(per_unit_value, 0.0)
+            continue
+
         frow = get_food_row(foods, ing["ingredient_food_name"], ing["ingredient_unit"])
         if frow is None:
+            missing_nutrients.update(spec["key"] for spec in TRACKED_NUTRIENTS)
             continue
-        qty = as_float(ing[qty_column], 0.0)
         for spec in TRACKED_NUTRIENTS:
             per_unit_value = frow.get(spec["food_per_unit_col"])
             if pd.isna(per_unit_value):
@@ -890,7 +943,16 @@ def clear_log_form():
 
 
 def clear_add_ingredient_form():
-    clear_session_keys(["add_ing_food", "add_ing_unit", "add_ing_qty"])
+    clear_session_keys(
+        [
+            "add_ing_type",
+            "add_ing_food",
+            "add_ing_unit",
+            "add_ing_batch",
+            "add_ing_batch_unit_label",
+            "add_ing_qty",
+        ]
+    )
 
 
 def clear_single_goal_form():
@@ -962,9 +1024,11 @@ def initialize_batch_ingredient_rows(
         rows.append(
             {
                 "row_id": next_row_id,
+                "ingredient_type": ingredient_type_for_row(ing),
                 "ingredient_food_name": ing["ingredient_food_name"],
                 "ingredient_unit": ing["ingredient_unit"],
                 "ingredient_qty": float(ing["ingredient_qty_per_serving"]),
+                "ingredient_batch_id": as_text(ing.get("ingredient_batch_id")),
             }
         )
         next_row_id += 1
@@ -993,9 +1057,11 @@ def add_batch_ingredient_row(batch_dish_name: str, foods: pd.DataFrame):
     rows.append(
         {
             "row_id": next_row_id,
+            "ingredient_type": "food",
             "ingredient_food_name": default_food,
             "ingredient_unit": default_unit,
             "ingredient_qty": 0.0,
+            "ingredient_batch_id": "",
         }
     )
     st.session_state[row_state_key] = rows
@@ -1089,7 +1155,11 @@ def get_dish_servings(row) -> float:
 
 
 def compute_dish_totals(
-    dish_name: str, dishes: pd.DataFrame, dings: pd.DataFrame, foods: pd.DataFrame
+    dish_name: str,
+    dishes: pd.DataFrame,
+    dings: pd.DataFrame,
+    foods: pd.DataFrame,
+    batches: pd.DataFrame,
 ):
     md = dishes[dishes["dish_name"] == dish_name]
     if md.empty:
@@ -1109,7 +1179,7 @@ def compute_dish_totals(
         return totals, missing_nutrients
 
     use = dings[dings["dish_name"] == dish_name]
-    return compute_ingredient_totals(use, foods, "ingredient_qty_per_serving")
+    return compute_ingredient_totals(use, foods, batches, "ingredient_qty_per_serving")
 
 
 def get_auto_dish_yield(
@@ -1134,7 +1204,11 @@ def get_effective_dish_yield(
 
 
 def get_dish_metrics(
-    dish_name: str, dishes: pd.DataFrame, dings: pd.DataFrame, foods: pd.DataFrame
+    dish_name: str,
+    dishes: pd.DataFrame,
+    dings: pd.DataFrame,
+    foods: pd.DataFrame,
+    batches: pd.DataFrame,
 ):
     md = dishes[dishes["dish_name"] == dish_name]
     if md.empty:
@@ -1147,7 +1221,9 @@ def get_dish_metrics(
 
     row = md.iloc[0]
     servings = get_dish_servings(row)
-    nutrient_totals, missing_nutrients = compute_dish_totals(dish_name, dishes, dings, foods)
+    nutrient_totals, missing_nutrients = compute_dish_totals(
+        dish_name, dishes, dings, foods, batches
+    )
     manual_qty, manual_unit = get_dish_yield(row)
     auto_qty, auto_unit = get_auto_dish_yield(dish_name, dings)
     return build_portion_metrics(
@@ -1162,9 +1238,13 @@ def get_dish_metrics(
 
 
 def get_dish_log_options(
-    dish_name: str, dishes: pd.DataFrame, dings: pd.DataFrame, foods: pd.DataFrame
+    dish_name: str,
+    dishes: pd.DataFrame,
+    dings: pd.DataFrame,
+    foods: pd.DataFrame,
+    batches: pd.DataFrame,
 ):
-    metrics = get_dish_metrics(dish_name, dishes, dings, foods)
+    metrics = get_dish_metrics(dish_name, dishes, dings, foods, batches)
     options = [("serving", "Serving")]
     if metrics["has_weight_basis"]:
         source = "manual final weight" if metrics["yield_source"] == "manual" else "auto final weight"
@@ -1186,9 +1266,10 @@ def compute_dish_base(
     dishes: pd.DataFrame,
     dings: pd.DataFrame,
     foods: pd.DataFrame,
+    batches: pd.DataFrame,
     log_unit: str = "serving",
 ):
-    metrics = get_dish_metrics(dish_name, dishes, dings, foods)
+    metrics = get_dish_metrics(dish_name, dishes, dings, foods, batches)
     if log_unit == "serving":
         return {
             spec["key"]: metrics[f"per_serving_{spec['key']}"]
@@ -1262,6 +1343,76 @@ def compute_batch_base(batch_row, log_unit: str = "serving"):
             for spec in TRACKED_NUTRIENTS
         }
     return {spec["key"]: 0.0 for spec in TRACKED_NUTRIENTS}
+
+
+def get_batch_basis_options(batch_row) -> list[tuple[str, str]]:
+    options = [("serving", "Serving")]
+    metrics = get_batch_metrics(batch_row)
+    if metrics["has_weight_basis"]:
+        options.append((metrics["final_unit"], f"Weight ({metrics['final_unit']})"))
+    return options
+
+
+def get_batch_select_options(batches: pd.DataFrame) -> list[tuple[str, str]]:
+    if batches.empty:
+        return []
+    batch_rows = batches.sort_values(["batch_date", "dish_name", "batch_id"], ascending=[False, True, False])
+    return [(batch_ref_label(row), as_text(row["batch_id"])) for _, row in batch_rows.iterrows()]
+
+
+def get_ingredient_unit_choices(
+    ingredient_type: str,
+    foods: pd.DataFrame,
+    batches: pd.DataFrame,
+    food_name: str = "",
+    batch_id: str = "",
+) -> list[str]:
+    if ingredient_type == "batch":
+        batch_row = get_batch_row(batches, batch_id) if batch_id else None
+        return [unit for unit, _ in get_batch_basis_options(batch_row)] if batch_row is not None else ["serving"]
+    if not food_name:
+        return [""]
+    unit_choices = sorted(
+        foods[foods["food_name"] == food_name]["unit"].dropna().astype(str).tolist()
+    )
+    return unit_choices or [""]
+
+
+def estimate_ingredient_row(row, foods: pd.DataFrame, batches: pd.DataFrame):
+    qty_value = as_float(row.get("ingredient_qty"), 0.0)
+    ingredient_type = ingredient_type_for_row(row)
+    if ingredient_type == "batch":
+        batch_id = as_text(row.get("ingredient_batch_id"))
+        batch_row = get_batch_row(batches, batch_id) if batch_id else None
+        if batch_row is None:
+            return None, None, None, "Batch missing"
+        unit_value = as_text(row.get("ingredient_unit"))
+        base_values = compute_batch_base(batch_row, unit_value)
+        valid_units = {unit for unit, _ in get_batch_basis_options(batch_row)}
+        if unit_value not in valid_units:
+            return None, None, None, "Basis missing"
+        est_c = qty_value * as_float(base_values["calories"], 0.0)
+        est_p = qty_value * as_float(base_values["protein"], 0.0)
+        est_f = (
+            qty_value * as_float(base_values["fiber"], 0.0)
+            if pd.notna(base_values["fiber"])
+            else None
+        )
+        return est_c, est_p, est_f, None
+
+    food_name = as_text(row.get("ingredient_food_name"))
+    unit_value = as_text(row.get("ingredient_unit"))
+    frow = get_food_row(foods, food_name, unit_value)
+    if frow is None:
+        return None, None, None, "Food missing"
+    est_c = qty_value * as_float(frow["cal_per_unit"], 0.0)
+    est_p = qty_value * as_float(frow["protein_per_unit"], 0.0)
+    est_f = (
+        qty_value * as_float(frow["fiber_per_unit"], 0.0)
+        if pd.notna(frow.get("fiber_per_unit"))
+        else None
+    )
+    return est_c, est_p, est_f, None
 
 
 def get_batch_consumption_summary(logs: pd.DataFrame, batch_row) -> dict:
@@ -1394,10 +1545,11 @@ def recalc_logs_for_dishes(
     dishes: pd.DataFrame,
     dings: pd.DataFrame,
     foods: pd.DataFrame,
+    batches: pd.DataFrame,
     dish_names: list,
 ) -> pd.DataFrame:
     for dn in dish_names:
-        metrics = get_dish_metrics(dn, dishes, dings, foods)
+        metrics = get_dish_metrics(dn, dishes, dings, foods, batches)
 
         serving_mask = (
             (logs["type"] == "dish")
@@ -1477,10 +1629,13 @@ def recalc_batches_for_food_refs(
     impacted_batch_ids = batch_ings[
         batch_ings.apply(
             lambda row: (
+                ingredient_type_for_row(row) == "food"
+                and (
                 as_text(row["ingredient_food_name"]),
                 as_text(row["ingredient_unit"]),
-            )
-            in impacted_ref_set,
+                )
+                in impacted_ref_set
+            ),
             axis=1,
         )
     ]["batch_id"].dropna().astype(str).unique().tolist()
@@ -1499,7 +1654,7 @@ def recalc_batches_for_food_refs(
             continue
 
         nutrient_totals, missing_nutrients = compute_ingredient_totals(
-            batch_snapshot, foods, "ingredient_qty"
+            batch_snapshot, foods, batches, "ingredient_qty"
         )
         auto_qty, auto_unit = get_auto_yield_from_ingredients(
             batch_snapshot, "ingredient_qty"
@@ -1536,6 +1691,103 @@ def recalc_batches_for_food_refs(
 
         updated_batch_row = get_batch_row(batches, batch_id)
         logs = recalc_logs_for_batch(logs, updated_batch_row)
+
+    return batches, logs
+
+
+def recalc_logs_for_batch_refs(
+    logs: pd.DataFrame,
+    dishes: pd.DataFrame,
+    dings: pd.DataFrame,
+    foods: pd.DataFrame,
+    batches: pd.DataFrame,
+    impacted_batch_ids: list[str],
+) -> pd.DataFrame:
+    impacted_ids = {as_text(batch_id) for batch_id in impacted_batch_ids if as_text(batch_id)}
+    if not impacted_ids or dings.empty:
+        return logs
+    impacted_dishes = sorted(
+        dings[
+            dings.apply(
+                lambda row: ingredient_type_for_row(row) == "batch"
+                and as_text(row.get("ingredient_batch_id")) in impacted_ids,
+                axis=1,
+            )
+        ]["dish_name"].dropna().astype(str).unique().tolist()
+    )
+    if impacted_dishes:
+        logs = recalc_logs_for_dishes(logs, dishes, dings, foods, batches, impacted_dishes)
+    return logs
+
+
+def recalc_batches_for_batch_refs(
+    batches: pd.DataFrame,
+    batch_ings: pd.DataFrame,
+    logs: pd.DataFrame,
+    foods: pd.DataFrame,
+    impacted_batch_ids: list[str],
+):
+    queue = [as_text(batch_id) for batch_id in impacted_batch_ids if as_text(batch_id)]
+    seen = set()
+    while queue:
+        source_batch_id = queue.pop(0)
+        if source_batch_id in seen:
+            continue
+        seen.add(source_batch_id)
+        dependent_batch_ids = batch_ings[
+            batch_ings.apply(
+                lambda row: ingredient_type_for_row(row) == "batch"
+                and as_text(row.get("ingredient_batch_id")) == source_batch_id,
+                axis=1,
+            )
+        ]["batch_id"].dropna().astype(str).unique().tolist()
+        for dependent_batch_id in dependent_batch_ids:
+            batch_match = batches[batches["batch_id"] == dependent_batch_id]
+            if batch_match.empty:
+                continue
+            batch_index = batch_match.index[0]
+            batch_row = batch_match.iloc[0]
+            batch_snapshot = batch_ings[batch_ings["batch_id"] == dependent_batch_id].copy()
+            if batch_snapshot.empty:
+                continue
+            nutrient_totals, missing_nutrients = compute_ingredient_totals(
+                batch_snapshot, foods, batches, "ingredient_qty"
+            )
+            auto_qty, auto_unit = get_auto_yield_from_ingredients(
+                batch_snapshot, "ingredient_qty"
+            )
+            manual_qty = (
+                as_float(batch_row["final_qty"], 0.0)
+                if as_text(batch_row.get("yield_source")) == "manual"
+                else 0.0
+            )
+            manual_unit = (
+                as_text(batch_row["final_unit"])
+                if as_text(batch_row.get("yield_source")) == "manual"
+                else ""
+            )
+            metrics = build_portion_metrics(
+                as_float(batch_row.get("servings"), 1.0),
+                nutrient_totals,
+                manual_qty,
+                manual_unit,
+                auto_qty,
+                auto_unit,
+                missing_nutrients,
+            )
+            batches.loc[batch_index, "final_qty"] = (
+                metrics["final_qty"] if metrics["has_weight_basis"] else None
+            )
+            batches.loc[batch_index, "final_unit"] = (
+                metrics["final_unit"] if metrics["has_weight_basis"] else None
+            )
+            batches.loc[batch_index, "yield_source"] = metrics["yield_source"]
+            for spec in TRACKED_NUTRIENTS:
+                batches.loc[batch_index, spec["batch_total_col"]] = metrics[spec["batch_total_col"]]
+
+            updated_batch_row = get_batch_row(batches, dependent_batch_id)
+            logs = recalc_logs_for_batch(logs, updated_batch_row)
+            queue.append(dependent_batch_id)
 
     return batches, logs
 
@@ -1708,13 +1960,13 @@ with tabs[0]:
             st.info("Add dishes in Master Data first.")
         else:
             d_name = st.selectbox("Dish", dish_names, key="log_dish_name")
-            dish_metrics = get_dish_metrics(d_name, dishes, dings, foods)
-            log_options = get_dish_log_options(d_name, dishes, dings, foods)
+            dish_metrics = get_dish_metrics(d_name, dishes, dings, foods, batches)
+            log_options = get_dish_log_options(d_name, dishes, dings, foods, batches)
             option_labels = [label for _, label in log_options]
             option_map = {label: unit for unit, label in log_options}
             selected_label = st.selectbox("Log by", option_labels, key="log_dish_basis")
             log_unit = option_map[selected_label]
-            base_values = compute_dish_base(d_name, dishes, dings, foods, log_unit)
+            base_values = compute_dish_base(d_name, dishes, dings, foods, batches, log_unit)
             basis_label = get_dish_basis_label(log_unit)
             est_c = qty * as_float(base_values["calories"], 0.0)
             est_p = qty * as_float(base_values["protein"], 0.0)
@@ -2170,7 +2422,7 @@ with tabs[1]:
                 )
         elif edit_row["type"] == "dish":
             base_values = compute_dish_base(
-                edit_row["name"], dishes, dings, foods, edit_row["unit"]
+                edit_row["name"], dishes, dings, foods, batches, edit_row["unit"]
             )
             preview_cal = new_qty * as_float(base_values["calories"], 0.0)
             preview_prot = new_qty * as_float(base_values["protein"], 0.0)
@@ -2575,11 +2827,12 @@ with tabs[3]:
 
             impacted_dishes = sorted(
                 dings[
-                    dings["ingredient_food_name"].isin([name for name, _ in impacted_food_refs])
+                    (dings["ingredient_type"].fillna("food") == "food")
+                    & dings["ingredient_food_name"].isin([name for name, _ in impacted_food_refs])
                 ]["dish_name"].unique().tolist()
             )
             if impacted_dishes:
-                logs = recalc_logs_for_dishes(logs, dishes, dings, foods, impacted_dishes)
+                logs = recalc_logs_for_dishes(logs, dishes, dings, foods, batches, impacted_dishes)
             batches, logs = recalc_batches_for_food_refs(
                 batches, batch_ings, logs, foods, impacted_food_refs
             )
@@ -2664,6 +2917,8 @@ with tabs[3]:
 
                     impacted_before = sorted(
                         dings[
+                            (dings["ingredient_type"].fillna("food") == "food")
+                            &
                             (dings["ingredient_food_name"] == old_name)
                             & (dings["ingredient_unit"] == old_unit)
                         ]["dish_name"]
@@ -2703,6 +2958,7 @@ with tabs[3]:
                         mask = (dings["ingredient_food_name"] == old_name) & (
                             dings["ingredient_unit"] == old_unit
                         )
+                        mask = mask & (dings["ingredient_type"].fillna("food") == "food")
                         dings.loc[mask, "ingredient_food_name"] = new_name
                         dings.loc[mask, "ingredient_unit"] = new_unit
                         save_df(dings, DISH_ING_CSV)
@@ -2712,6 +2968,8 @@ with tabs[3]:
                     logs = recalc_logs_for_food(logs, foods, new_name, new_unit)
                     impacted_after = sorted(
                         dings[
+                            (dings["ingredient_type"].fillna("food") == "food")
+                            &
                             (dings["ingredient_food_name"] == new_name)
                             & (dings["ingredient_unit"] == new_unit)
                         ]["dish_name"]
@@ -2720,7 +2978,7 @@ with tabs[3]:
                     )
                     impacted = sorted(set(impacted_before) | set(impacted_after))
                     if impacted:
-                        logs = recalc_logs_for_dishes(logs, dishes, dings, foods, impacted)
+                        logs = recalc_logs_for_dishes(logs, dishes, dings, foods, batches, impacted)
                     batches, logs = recalc_batches_for_food_refs(
                         batches,
                         batch_ings,
@@ -2755,6 +3013,8 @@ with tabs[3]:
                 & (logs["unit"] == funit)
             ]
             affected_ings = dings[
+                (dings["ingredient_type"].fillna("food") == "food")
+                &
                 (dings["ingredient_food_name"] == fname)
                 & (dings["ingredient_unit"] == funit)
             ]
@@ -2774,7 +3034,7 @@ with tabs[3]:
 
                     if impacted_dishes:
                         logs = recalc_logs_for_dishes(
-                            logs, dishes, dings, foods, impacted_dishes
+                            logs, dishes, dings, foods, batches, impacted_dishes
                         )
 
                     save_df(foods, FOODS_CSV)
@@ -2902,7 +3162,7 @@ with tabs[3]:
                         yield_unitv,
                     ]
                 save_df(dishes, DISHES_CSV)
-                logs = recalc_logs_for_dishes(logs, dishes, dings, foods, [dname])
+                logs = recalc_logs_for_dishes(logs, dishes, dings, foods, batches, [dname])
                 save_df(logs, LOGS_CSV)
                 clear_add_dish_form()
                 st.session_state.master_data_message = "Dish saved and logs recalculated."
@@ -3074,28 +3334,73 @@ with tabs[3]:
                         yield_unitv,
                     ]
                     save_df(dishes, DISHES_CSV)
-                    logs = recalc_logs_for_dishes(logs, dishes, dings, foods, [dsel_edit])
+                    logs = recalc_logs_for_dishes(logs, dishes, dings, foods, batches, [dsel_edit])
                     save_df(logs, LOGS_CSV)
                     st.success(f"Dish {dsel_edit} updated and logs recalculated.")
                     st.rerun()
 
     with st.expander("Add ingredient to dish (for computed dishes)"):
         st.caption(
-            "Add foods into an ingredient-based dish. Quantities are recipe quantities in the selected food unit. Example: 200g raw dal + 20g ghee + 500ml water."
+            "Add foods or saved batches into an ingredient-based dish. Example: 200g raw dal + 20g ghee + 300g of yesterday's cooked rajma batch."
         )
-        if dishes.empty or foods.empty:
-            st.info("Add at least one dish and one food first.")
+        if dishes.empty or (foods.empty and batches.empty):
+            st.info("Add at least one dish plus either one food or one batch first.")
         else:
             dsel = st.selectbox(
                 "Dish", sorted(dishes["dish_name"].tolist()), key="add_ing_dish"
             )
-            fsel = st.selectbox(
-                "Ingredient food",
-                sorted(foods["food_name"].unique().tolist()),
-                key="add_ing_food",
+            ing_type = st.selectbox(
+                "Ingredient source",
+                ["Food", "Batch"],
+                key="add_ing_type",
             )
-            units = sorted(foods[foods["food_name"] == fsel]["unit"].unique().tolist())
-            u_sel = st.selectbox("Ingredient unit", units, key="add_ing_unit")
+            ingredient_type = ing_type.lower()
+            ingredient_food_name = ""
+            ingredient_batch_id = ""
+            if ingredient_type == "food":
+                if foods.empty:
+                    st.info("No foods available. Choose Batch instead.")
+                    ingredient_type = "batch"
+                else:
+                    fsel = st.selectbox(
+                        "Ingredient food",
+                        sorted(foods["food_name"].unique().tolist()),
+                        key="add_ing_food",
+                    )
+                    units = get_ingredient_unit_choices("food", foods, batches, food_name=fsel)
+                    u_sel = st.selectbox("Ingredient unit", units, key="add_ing_unit")
+                    ingredient_food_name = fsel
+                    ingredient_batch_id = ""
+            if ingredient_type == "batch":
+                batch_options = get_batch_select_options(batches)
+                if not batch_options:
+                    st.info("No saved batches available. Choose Food instead.")
+                    ingredient_type = "food"
+                    ingredient_food_name = ""
+                    u_sel = ""
+                else:
+                    batch_map = dict(batch_options)
+                    selected_batch_label = st.selectbox(
+                        "Ingredient batch",
+                        list(batch_map.keys()),
+                        key="add_ing_batch",
+                    )
+                    ingredient_batch_id = batch_map[selected_batch_label]
+                    selected_batch_row = get_batch_row(batches, ingredient_batch_id)
+                    ingredient_food_name = (
+                        as_text(selected_batch_row["dish_name"]) if selected_batch_row is not None else ""
+                    )
+                    units = get_ingredient_unit_choices(
+                        "batch", foods, batches, batch_id=ingredient_batch_id
+                    )
+                    unit_label_map = dict(get_batch_basis_options(selected_batch_row))
+                    selected_unit_label = st.selectbox(
+                        "Ingredient basis",
+                        [unit_label_map[unit] for unit in units],
+                        key="add_ing_batch_unit_label",
+                    )
+                    reverse_unit_map = {label: unit for unit, label in unit_label_map.items()}
+                    u_sel = reverse_unit_map[selected_unit_label]
             qty = st.number_input(
                 "Ingredient qty in recipe",
                 min_value=0.0,
@@ -3106,11 +3411,20 @@ with tabs[3]:
             if st.button("Add ingredient", key="add_ing_button"):
                 if qty <= 0:
                     st.error("Quantity must be > 0.")
+                elif not ingredient_food_name or not u_sel:
+                    st.error("Choose a valid ingredient source and basis/unit.")
                 else:
-                    dings.loc[len(dings)] = [dsel, fsel, u_sel, qty]
+                    dings.loc[len(dings)] = [
+                        dsel,
+                        ingredient_type,
+                        ingredient_food_name,
+                        u_sel,
+                        qty,
+                        ingredient_batch_id,
+                    ]
                     save_df(dings, DISH_ING_CSV)
                     # Recalculate logs for this dish
-                    logs = recalc_logs_for_dishes(logs, dishes, dings, foods, [dsel])
+                    logs = recalc_logs_for_dishes(logs, dishes, dings, foods, batches, [dsel])
                     save_df(logs, LOGS_CSV)
                     clear_add_ingredient_form()
                     st.session_state.master_data_message = "Ingredient added and logs recalculated."
@@ -3135,39 +3449,86 @@ with tabs[3]:
                 st.write("Current ingredients (edit inline):")
                 for i, ing in cur_ings.iterrows():
                     st.markdown(
-                        f"**{ing['ingredient_food_name']} [{ing['ingredient_unit']}]**"
+                        f"**{ingredient_ref_label(ing, batches)}**"
                     )
+                    current_type = "Batch" if ingredient_type_for_row(ing) == "batch" else "Food"
+                    batch_options = get_batch_select_options(batches)
+                    batch_map = dict(batch_options)
+                    batch_labels = list(batch_map.keys())
+                    selected_batch_id = as_text(ing.get("ingredient_batch_id"))
+                    selected_batch_label = (
+                        next((label for label, batch_id in batch_options if batch_id == selected_batch_id), None)
+                        if batch_options
+                        else None
+                    )
+                    food_choices = sorted(foods["food_name"].unique().tolist())
 
-                    fcol1, fcol2, fcol3, fcol4 = st.columns([3, 2, 2, 2])
+                    fcol1, fcol2, fcol3, fcol4, fcol5 = st.columns([2, 3, 2, 2, 2])
                     with fcol1:
-                        food_choice = st.selectbox(
-                            "Food",
-                            sorted(foods["food_name"].unique().tolist()),
-                            index=sorted(foods["food_name"].unique().tolist()).index(
-                                ing["ingredient_food_name"]
-                            )
-                            if ing["ingredient_food_name"] in foods["food_name"].unique()
-                            else 0,
-                            key=f"ing_food_{i}",
+                        source_choice = st.selectbox(
+                            "Source",
+                            ["Food", "Batch"],
+                            index=["Food", "Batch"].index(current_type),
+                            key=f"ing_type_{i}",
                         )
                     with fcol2:
-                        unit_options = sorted(
-                            foods[foods["food_name"] == food_choice]["unit"]
-                            .unique()
-                            .tolist()
-                        )
-                        default_unit_idx = (
-                            unit_options.index(ing["ingredient_unit"])
-                            if ing["ingredient_unit"] in unit_options
-                            else 0
-                        )
-                        unit_choice = st.selectbox(
-                            "Unit",
-                            unit_options,
-                            index=default_unit_idx,
-                            key=f"ing_unit_{i}",
-                        )
+                        if source_choice == "Food":
+                            food_choice = st.selectbox(
+                                "Food",
+                                food_choices if food_choices else [""],
+                                index=food_choices.index(ing["ingredient_food_name"])
+                                if food_choices and ing["ingredient_food_name"] in food_choices
+                                else 0,
+                                key=f"ing_food_{i}",
+                            )
+                            batch_choice_id = ""
+                            batch_choice_label = None
+                        else:
+                            batch_choice_label = st.selectbox(
+                                "Batch",
+                                batch_labels if batch_labels else ["No saved batches"],
+                                index=batch_labels.index(selected_batch_label)
+                                if batch_labels and selected_batch_label in batch_labels
+                                else 0,
+                                key=f"ing_batch_{i}",
+                            )
+                            batch_choice_id = batch_map.get(batch_choice_label, "")
+                            batch_choice_row = get_batch_row(batches, batch_choice_id)
+                            food_choice = (
+                                as_text(batch_choice_row["dish_name"]) if batch_choice_row is not None else ""
+                            )
                     with fcol3:
+                        unit_options = get_ingredient_unit_choices(
+                            source_choice.lower(),
+                            foods,
+                            batches,
+                            food_name=food_choice,
+                            batch_id=batch_choice_id if source_choice == "Batch" else "",
+                        )
+                        if source_choice == "Batch":
+                            batch_choice_row = get_batch_row(batches, batch_choice_id) if batch_choice_id else None
+                            unit_label_map = dict(get_batch_basis_options(batch_choice_row))
+                            reverse_unit_map = {label: unit for unit, label in unit_label_map.items()}
+                            current_unit_label = unit_label_map.get(as_text(ing["ingredient_unit"]), unit_label_map.get(unit_options[0], unit_options[0]))
+                            unit_choice_label = st.selectbox(
+                                "Basis",
+                                [unit_label_map[unit] for unit in unit_options],
+                                index=[unit_label_map[unit] for unit in unit_options].index(current_unit_label)
+                                if current_unit_label in [unit_label_map[unit] for unit in unit_options]
+                                else 0,
+                                key=f"ing_unit_{i}",
+                            )
+                            unit_choice = reverse_unit_map[unit_choice_label]
+                        else:
+                            unit_choice = st.selectbox(
+                                "Unit",
+                                unit_options,
+                                index=unit_options.index(ing["ingredient_unit"])
+                                if ing["ingredient_unit"] in unit_options
+                                else 0,
+                                key=f"ing_unit_{i}",
+                            )
+                    with fcol4:
                         qty_choice = st.number_input(
                             "Ingredient qty in recipe",
                             min_value=0.0,
@@ -3175,28 +3536,53 @@ with tabs[3]:
                             value=float(ing["ingredient_qty_per_serving"]),
                             key=f"ing_qty_{i}",
                         )
-                    with fcol4:
+                    with fcol5:
+                        preview_row = {
+                            "ingredient_type": source_choice.lower(),
+                            "ingredient_food_name": food_choice,
+                            "ingredient_unit": unit_choice,
+                            "ingredient_qty": qty_choice,
+                            "ingredient_batch_id": batch_choice_id if source_choice == "Batch" else "",
+                        }
+                        est_c, est_p, est_f, err_text = estimate_ingredient_row(preview_row, foods, batches)
+                        if err_text:
+                            st.caption(err_text)
+                        else:
+                            st.caption(
+                                f"{est_c:.0f} kcal | {est_p:.1f}g protein | {format_nutrient_value('fiber', est_f, with_unit=True)} fiber"
+                            )
+                    action_col1, action_col2 = st.columns(2)
+                    with action_col1:
                         if st.button("Update", key=f"ing_update_{i}"):
                             dings.loc[
                                 i,
                                 [
+                                    "ingredient_type",
                                     "ingredient_food_name",
                                     "ingredient_unit",
                                     "ingredient_qty_per_serving",
+                                    "ingredient_batch_id",
                                 ],
-                            ] = [food_choice, unit_choice, qty_choice]
+                            ] = [
+                                source_choice.lower(),
+                                food_choice,
+                                unit_choice,
+                                qty_choice,
+                                batch_choice_id if source_choice == "Batch" else "",
+                            ]
                             save_df(dings, DISH_ING_CSV)
                             logs = recalc_logs_for_dishes(
-                                logs, dishes, dings, foods, [dsel_ing]
+                                logs, dishes, dings, foods, batches, [dsel_ing]
                             )
                             save_df(logs, LOGS_CSV)
                             st.success("Ingredient updated and logs recalculated.")
                             st.rerun()
+                    with action_col2:
                         if st.button("Remove", key=f"ing_remove_{i}"):
                             dings = dings.drop(i)
                             save_df(dings, DISH_ING_CSV)
                             logs = recalc_logs_for_dishes(
-                                logs, dishes, dings, foods, [dsel_ing]
+                                logs, dishes, dings, foods, batches, [dsel_ing]
                             )
                             save_df(logs, LOGS_CSV)
                             st.success("Ingredient removed and logs recalculated.")
@@ -3211,7 +3597,7 @@ with tabs[3]:
         else:
             preview = []
             for dname in sorted(dishes["dish_name"].tolist()):
-                metrics = get_dish_metrics(dname, dishes, dings, foods)
+                metrics = get_dish_metrics(dname, dishes, dings, foods, batches)
                 preview.append(
                     {
                         "dish_name": dname,
@@ -3319,34 +3705,60 @@ with tabs[3]:
                 )
                 remove_row_id = None
                 food_choices = sorted(foods["food_name"].unique().tolist())
+                batch_options = get_batch_select_options(batches)
+                batch_map = dict(batch_options)
+                batch_labels = list(batch_map.keys())
                 current_rows = list(st.session_state.get(row_state_key, []))
                 if not current_rows:
                     st.info("No ingredient rows yet. Add one below if this batch needs ingredients.")
 
                 for row in current_rows:
                     row_id = row["row_id"]
+                    type_key_name = f"{row_state_key}_{row_id}_type"
                     food_key_name = f"{row_state_key}_{row_id}_food"
+                    batch_key_name = f"{row_state_key}_{row_id}_batch"
                     unit_key_name = f"{row_state_key}_{row_id}_unit"
                     qty_key_name = f"{row_state_key}_{row_id}_qty"
 
+                    if type_key_name not in st.session_state:
+                        st.session_state[type_key_name] = (
+                            "Batch" if row.get("ingredient_type") == "batch" else "Food"
+                        )
                     if food_key_name not in st.session_state:
                         st.session_state[food_key_name] = row["ingredient_food_name"]
+                    if batch_key_name not in st.session_state:
+                        st.session_state[batch_key_name] = next(
+                            (
+                                label
+                                for label, batch_id in batch_options
+                                if batch_id == as_text(row.get("ingredient_batch_id"))
+                            ),
+                            batch_labels[0] if batch_labels else "",
+                        )
                     if qty_key_name not in st.session_state:
                         st.session_state[qty_key_name] = float(row["ingredient_qty"])
 
+                    source_choice = st.session_state.get(type_key_name, "Food")
                     selected_food = st.session_state.get(food_key_name, "")
-                    if selected_food not in food_choices and food_choices:
+                    selected_batch_label = st.session_state.get(
+                        batch_key_name, batch_labels[0] if batch_labels else ""
+                    )
+                    selected_batch_id = batch_map.get(selected_batch_label, "")
+                    if source_choice == "Food" and selected_food not in food_choices and food_choices:
                         selected_food = food_choices[0]
                         st.session_state[food_key_name] = selected_food
+                    if source_choice == "Batch" and batch_labels and selected_batch_label not in batch_labels:
+                        selected_batch_label = batch_labels[0]
+                        st.session_state[batch_key_name] = selected_batch_label
+                        selected_batch_id = batch_map.get(selected_batch_label, "")
 
-                    unit_choices = sorted(
-                        foods[foods["food_name"] == selected_food]["unit"]
-                        .dropna()
-                        .astype(str)
-                        .tolist()
+                    unit_choices = get_ingredient_unit_choices(
+                        source_choice.lower(),
+                        foods,
+                        batches,
+                        food_name=selected_food,
+                        batch_id=selected_batch_id,
                     )
-                    if not unit_choices:
-                        unit_choices = [""]
                     if (
                         unit_key_name not in st.session_state
                         or st.session_state[unit_key_name] not in unit_choices
@@ -3356,28 +3768,85 @@ with tabs[3]:
                             preferred_unit if preferred_unit in unit_choices else unit_choices[0]
                         )
 
-                    c1, c2, c3, c4, c5 = st.columns([3, 2, 2, 2, 1])
+                    c1, c2, c3, c4, c5, c6 = st.columns([1.4, 2.6, 2, 2, 2, 1])
                     with c1:
-                        food_choice = st.selectbox(
-                            "Ingredient food",
-                            food_choices if food_choices else [""],
-                            index=(
-                                (food_choices if food_choices else [""]).index(selected_food)
-                                if selected_food in (food_choices if food_choices else [""])
-                                else 0
-                            ),
-                            key=food_key_name,
+                        source_choice = st.selectbox(
+                            "Source",
+                            ["Food", "Batch"],
+                            index=["Food", "Batch"].index(source_choice),
+                            key=type_key_name,
                             label_visibility="collapsed",
                         )
                     with c2:
-                        unit_choice = st.selectbox(
-                            "Ingredient unit",
-                            unit_choices,
-                            index=unit_choices.index(st.session_state[unit_key_name]),
-                            key=unit_key_name,
-                            label_visibility="collapsed",
-                        )
+                        if source_choice == "Batch":
+                            batch_choice_label = st.selectbox(
+                                "Ingredient batch",
+                                batch_labels if batch_labels else ["No saved batches"],
+                                index=batch_labels.index(selected_batch_label)
+                                if batch_labels and selected_batch_label in batch_labels
+                                else 0,
+                                key=batch_key_name,
+                                label_visibility="collapsed",
+                            )
+                            batch_choice_id = batch_map.get(batch_choice_label, "")
+                            batch_choice_row = get_batch_row(batches, batch_choice_id)
+                            food_choice = (
+                                as_text(batch_choice_row["dish_name"]) if batch_choice_row is not None else ""
+                            )
+                        else:
+                            batch_choice_id = ""
+                            food_choice = st.selectbox(
+                                "Ingredient food",
+                                food_choices if food_choices else [""],
+                                index=(
+                                    (food_choices if food_choices else [""]).index(selected_food)
+                                    if selected_food in (food_choices if food_choices else [""])
+                                    else 0
+                                ),
+                                key=food_key_name,
+                                label_visibility="collapsed",
+                            )
                     with c3:
+                        unit_choices = get_ingredient_unit_choices(
+                            source_choice.lower(),
+                            foods,
+                            batches,
+                            food_name=food_choice,
+                            batch_id=batch_choice_id,
+                        )
+                        if source_choice == "Batch":
+                            batch_choice_row = get_batch_row(batches, batch_choice_id) if batch_choice_id else None
+                            unit_label_map = dict(get_batch_basis_options(batch_choice_row))
+                            reverse_unit_map = {label: unit for unit, label in unit_label_map.items()}
+                            unit_labels = [unit_label_map[unit] for unit in unit_choices]
+                            current_unit_label = unit_label_map.get(
+                                st.session_state.get(unit_key_name, unit_choices[0]),
+                                unit_labels[0],
+                            )
+                            unit_choice_label = st.selectbox(
+                                "Ingredient basis",
+                                unit_labels,
+                                index=unit_labels.index(current_unit_label)
+                                if current_unit_label in unit_labels
+                                else 0,
+                                key=f"{unit_key_name}_label",
+                                label_visibility="collapsed",
+                            )
+                            unit_choice = reverse_unit_map[unit_choice_label]
+                            st.session_state[unit_key_name] = unit_choice
+                        else:
+                            unit_choice = st.selectbox(
+                                "Ingredient unit",
+                                unit_choices,
+                                index=(
+                                    unit_choices.index(st.session_state[unit_key_name])
+                                    if st.session_state[unit_key_name] in unit_choices
+                                    else 0
+                                ),
+                                key=unit_key_name,
+                                label_visibility="collapsed",
+                            )
+                    with c4:
                         qty_value = st.number_input(
                             "Qty",
                             min_value=0.0,
@@ -3385,34 +3854,40 @@ with tabs[3]:
                             key=qty_key_name,
                             label_visibility="collapsed",
                         )
-                    with c4:
-                        frow = get_food_row(foods, food_choice, unit_choice)
-                        if frow is None:
-                            st.caption("Food missing")
+                    with c5:
+                        preview_row = {
+                            "ingredient_type": source_choice.lower(),
+                            "ingredient_food_name": food_choice,
+                            "ingredient_unit": unit_choice,
+                            "ingredient_qty": qty_value,
+                            "ingredient_batch_id": batch_choice_id,
+                        }
+                        est_c, est_p, est_f, err_text = estimate_ingredient_row(
+                            preview_row, foods, batches
+                        )
+                        if err_text:
+                            st.caption(err_text)
                         else:
-                            est_c = qty_value * as_float(frow["cal_per_unit"], 0.0)
-                            est_p = qty_value * as_float(frow["protein_per_unit"], 0.0)
-                            est_f = (
-                                qty_value * as_float(frow["fiber_per_unit"], 0.0)
-                                if pd.notna(frow.get("fiber_per_unit"))
-                                else None
-                            )
                             st.caption(
                                 f"{est_c:.0f} kcal | {est_p:.1f}g protein | {format_nutrient_value('fiber', est_f, with_unit=True)} fiber"
                             )
-                    with c5:
+                    with c6:
                         if st.button("Remove", key=f"{row_state_key}_{row_id}_remove"):
                             remove_row_id = row_id
 
+                    row["ingredient_type"] = source_choice.lower()
                     row["ingredient_food_name"] = food_choice
                     row["ingredient_unit"] = unit_choice
                     row["ingredient_qty"] = qty_value
+                    row["ingredient_batch_id"] = batch_choice_id
                     if qty_value > 0 and food_choice and unit_choice:
                         batch_ingredient_rows.append(
                             {
+                                "ingredient_type": source_choice.lower(),
                                 "ingredient_food_name": food_choice,
                                 "ingredient_unit": unit_choice,
                                 "ingredient_qty": qty_value,
+                                "ingredient_batch_id": batch_choice_id,
                             }
                         )
 
@@ -3447,7 +3922,7 @@ with tabs[3]:
             elif batch_ingredient_rows:
                 batch_ingredients_df = pd.DataFrame(batch_ingredient_rows)
                 nutrient_totals, missing_nutrients = compute_ingredient_totals(
-                    batch_ingredients_df, foods, "ingredient_qty"
+                    batch_ingredients_df, foods, batches, "ingredient_qty"
                 )
                 auto_qty, auto_unit = get_auto_yield_from_ingredients(
                     batch_ingredients_df, "ingredient_qty"
@@ -3618,7 +4093,20 @@ with tabs[3]:
             if batch_ing_view.empty:
                 st.info("No batch ingredient snapshot stored for this batch.")
             else:
-                st.dataframe(batch_ing_view, hide_index=True, use_container_width=True)
+                batch_ing_view["ingredient_source"] = batch_ing_view.apply(
+                    lambda row: ingredient_ref_label(row, batches), axis=1
+                )
+                st.dataframe(
+                    batch_ing_view[
+                        [
+                            "ingredient_source",
+                            "ingredient_unit",
+                            "ingredient_qty",
+                        ]
+                    ],
+                    hide_index=True,
+                    use_container_width=True,
+                )
 
     section_heading(
         "Edit a batch",
@@ -3702,34 +4190,60 @@ with tabs[3]:
                 )
                 remove_row_id = None
                 food_choices = sorted(foods["food_name"].unique().tolist())
+                batch_options = get_batch_select_options(batches)
+                batch_map = dict(batch_options)
+                batch_labels = list(batch_map.keys())
                 current_rows = list(st.session_state.get(row_state_key, []))
                 if not current_rows:
                     st.info("No ingredient rows yet. Add one below if this batch needs ingredients.")
 
                 for row in current_rows:
                     row_id = row["row_id"]
+                    type_key_name = f"{row_state_key}_{row_id}_type"
                     food_key_name = f"{row_state_key}_{row_id}_food"
+                    batch_key_name = f"{row_state_key}_{row_id}_batch"
                     unit_key_name = f"{row_state_key}_{row_id}_unit"
                     qty_key_name = f"{row_state_key}_{row_id}_qty"
 
+                    if type_key_name not in st.session_state:
+                        st.session_state[type_key_name] = (
+                            "Batch" if row.get("ingredient_type") == "batch" else "Food"
+                        )
                     if food_key_name not in st.session_state:
                         st.session_state[food_key_name] = row["ingredient_food_name"]
+                    if batch_key_name not in st.session_state:
+                        st.session_state[batch_key_name] = next(
+                            (
+                                label
+                                for label, batch_id in batch_options
+                                if batch_id == as_text(row.get("ingredient_batch_id"))
+                            ),
+                            batch_labels[0] if batch_labels else "",
+                        )
                     if qty_key_name not in st.session_state:
                         st.session_state[qty_key_name] = float(row["ingredient_qty"])
 
+                    source_choice = st.session_state.get(type_key_name, "Food")
                     selected_food = st.session_state.get(food_key_name, "")
-                    if selected_food not in food_choices and food_choices:
+                    selected_batch_label = st.session_state.get(
+                        batch_key_name, batch_labels[0] if batch_labels else ""
+                    )
+                    selected_batch_id = batch_map.get(selected_batch_label, "")
+                    if source_choice == "Food" and selected_food not in food_choices and food_choices:
                         selected_food = food_choices[0]
                         st.session_state[food_key_name] = selected_food
+                    if source_choice == "Batch" and batch_labels and selected_batch_label not in batch_labels:
+                        selected_batch_label = batch_labels[0]
+                        st.session_state[batch_key_name] = selected_batch_label
+                        selected_batch_id = batch_map.get(selected_batch_label, "")
 
-                    unit_choices = sorted(
-                        foods[foods["food_name"] == selected_food]["unit"]
-                        .dropna()
-                        .astype(str)
-                        .tolist()
+                    unit_choices = get_ingredient_unit_choices(
+                        source_choice.lower(),
+                        foods,
+                        batches,
+                        food_name=selected_food,
+                        batch_id=selected_batch_id,
                     )
-                    if not unit_choices:
-                        unit_choices = [""]
                     if (
                         unit_key_name not in st.session_state
                         or st.session_state[unit_key_name] not in unit_choices
@@ -3739,28 +4253,85 @@ with tabs[3]:
                             preferred_unit if preferred_unit in unit_choices else unit_choices[0]
                         )
 
-                    c1, c2, c3, c4, c5 = st.columns([3, 2, 2, 2, 1])
+                    c1, c2, c3, c4, c5, c6 = st.columns([1.4, 2.6, 2, 2, 2, 1])
                     with c1:
-                        food_choice = st.selectbox(
-                            "Ingredient food",
-                            food_choices if food_choices else [""],
-                            index=(
-                                (food_choices if food_choices else [""]).index(selected_food)
-                                if selected_food in (food_choices if food_choices else [""])
-                                else 0
-                            ),
-                            key=food_key_name,
+                        source_choice = st.selectbox(
+                            "Source",
+                            ["Food", "Batch"],
+                            index=["Food", "Batch"].index(source_choice),
+                            key=type_key_name,
                             label_visibility="collapsed",
                         )
                     with c2:
-                        unit_choice = st.selectbox(
-                            "Ingredient unit",
-                            unit_choices,
-                            index=unit_choices.index(st.session_state[unit_key_name]),
-                            key=unit_key_name,
-                            label_visibility="collapsed",
-                        )
+                        if source_choice == "Batch":
+                            batch_choice_label = st.selectbox(
+                                "Ingredient batch",
+                                batch_labels if batch_labels else ["No saved batches"],
+                                index=batch_labels.index(selected_batch_label)
+                                if batch_labels and selected_batch_label in batch_labels
+                                else 0,
+                                key=batch_key_name,
+                                label_visibility="collapsed",
+                            )
+                            batch_choice_id = batch_map.get(batch_choice_label, "")
+                            batch_choice_row = get_batch_row(batches, batch_choice_id)
+                            food_choice = (
+                                as_text(batch_choice_row["dish_name"]) if batch_choice_row is not None else ""
+                            )
+                        else:
+                            batch_choice_id = ""
+                            food_choice = st.selectbox(
+                                "Ingredient food",
+                                food_choices if food_choices else [""],
+                                index=(
+                                    (food_choices if food_choices else [""]).index(selected_food)
+                                    if selected_food in (food_choices if food_choices else [""])
+                                    else 0
+                                ),
+                                key=food_key_name,
+                                label_visibility="collapsed",
+                            )
                     with c3:
+                        unit_choices = get_ingredient_unit_choices(
+                            source_choice.lower(),
+                            foods,
+                            batches,
+                            food_name=food_choice,
+                            batch_id=batch_choice_id,
+                        )
+                        if source_choice == "Batch":
+                            batch_choice_row = get_batch_row(batches, batch_choice_id) if batch_choice_id else None
+                            unit_label_map = dict(get_batch_basis_options(batch_choice_row))
+                            reverse_unit_map = {label: unit for unit, label in unit_label_map.items()}
+                            unit_labels = [unit_label_map[unit] for unit in unit_choices]
+                            current_unit_label = unit_label_map.get(
+                                st.session_state.get(unit_key_name, unit_choices[0]),
+                                unit_labels[0],
+                            )
+                            unit_choice_label = st.selectbox(
+                                "Ingredient basis",
+                                unit_labels,
+                                index=unit_labels.index(current_unit_label)
+                                if current_unit_label in unit_labels
+                                else 0,
+                                key=f"{unit_key_name}_label",
+                                label_visibility="collapsed",
+                            )
+                            unit_choice = reverse_unit_map[unit_choice_label]
+                            st.session_state[unit_key_name] = unit_choice
+                        else:
+                            unit_choice = st.selectbox(
+                                "Ingredient unit",
+                                unit_choices,
+                                index=(
+                                    unit_choices.index(st.session_state[unit_key_name])
+                                    if st.session_state[unit_key_name] in unit_choices
+                                    else 0
+                                ),
+                                key=unit_key_name,
+                                label_visibility="collapsed",
+                            )
+                    with c4:
                         qty_value = st.number_input(
                             "Qty",
                             min_value=0.0,
@@ -3768,34 +4339,40 @@ with tabs[3]:
                             key=qty_key_name,
                             label_visibility="collapsed",
                         )
-                    with c4:
-                        frow = get_food_row(foods, food_choice, unit_choice)
-                        if frow is None:
-                            st.caption("Food missing")
+                    with c5:
+                        preview_row = {
+                            "ingredient_type": source_choice.lower(),
+                            "ingredient_food_name": food_choice,
+                            "ingredient_unit": unit_choice,
+                            "ingredient_qty": qty_value,
+                            "ingredient_batch_id": batch_choice_id,
+                        }
+                        est_c, est_p, est_f, err_text = estimate_ingredient_row(
+                            preview_row, foods, batches
+                        )
+                        if err_text:
+                            st.caption(err_text)
                         else:
-                            est_c = qty_value * as_float(frow["cal_per_unit"], 0.0)
-                            est_p = qty_value * as_float(frow["protein_per_unit"], 0.0)
-                            est_f = (
-                                qty_value * as_float(frow["fiber_per_unit"], 0.0)
-                                if pd.notna(frow.get("fiber_per_unit"))
-                                else None
-                            )
                             st.caption(
                                 f"{est_c:.0f} kcal | {est_p:.1f}g protein | {format_nutrient_value('fiber', est_f, with_unit=True)} fiber"
                             )
-                    with c5:
+                    with c6:
                         if st.button("Remove", key=f"{row_state_key}_{row_id}_remove"):
                             remove_row_id = row_id
 
+                    row["ingredient_type"] = source_choice.lower()
                     row["ingredient_food_name"] = food_choice
                     row["ingredient_unit"] = unit_choice
                     row["ingredient_qty"] = qty_value
+                    row["ingredient_batch_id"] = batch_choice_id
                     if qty_value > 0 and food_choice and unit_choice:
                         edit_batch_ingredient_rows.append(
                             {
+                                "ingredient_type": source_choice.lower(),
                                 "ingredient_food_name": food_choice,
                                 "ingredient_unit": unit_choice,
                                 "ingredient_qty": qty_value,
+                                "ingredient_batch_id": batch_choice_id,
                             }
                         )
 
@@ -3830,7 +4407,7 @@ with tabs[3]:
             elif edit_batch_ingredient_rows:
                 edit_batch_ingredients_df = pd.DataFrame(edit_batch_ingredient_rows)
                 nutrient_totals, missing_nutrients = compute_ingredient_totals(
-                    edit_batch_ingredients_df, foods, "ingredient_qty"
+                    edit_batch_ingredients_df, foods, batches, "ingredient_qty"
                 )
                 auto_qty, auto_unit = get_auto_yield_from_ingredients(
                     edit_batch_ingredients_df, "ingredient_qty"
@@ -3906,6 +4483,15 @@ with tabs[3]:
                         (logs["type"] == "batch") & (logs["batch_id"] == batch_id),
                         "batch_id",
                     ] = new_batch_id
+                    if new_batch_id != batch_id:
+                        dings.loc[
+                            dings["ingredient_batch_id"] == batch_id,
+                            "ingredient_batch_id",
+                        ] = new_batch_id
+                        batch_ings.loc[
+                            batch_ings["ingredient_batch_id"] == batch_id,
+                            "ingredient_batch_id",
+                        ] = new_batch_id
                     batch_ings = batch_ings[batch_ings["batch_id"] != batch_id]
                     if edit_batch_ingredient_rows:
                         edit_batch_ingredients_to_save = pd.DataFrame(edit_batch_ingredient_rows)
@@ -3917,9 +4503,16 @@ with tabs[3]:
 
                     updated_batch_row = get_batch_row(batches, new_batch_id)
                     logs = recalc_logs_for_batch(logs, updated_batch_row)
+                    logs = recalc_logs_for_batch_refs(
+                        logs, dishes, dings, foods, batches, [new_batch_id]
+                    )
+                    batches, logs = recalc_batches_for_batch_refs(
+                        batches, batch_ings, logs, foods, [new_batch_id]
+                    )
 
                     save_df(batches, BATCHES_CSV)
                     save_df(batch_ings, BATCH_ING_CSV)
+                    save_df(dings, DISH_ING_CSV)
                     save_df(logs, LOGS_CSV)
                     st.success("Batch updated.")
                     st.rerun()
@@ -3940,15 +4533,29 @@ with tabs[3]:
                 (logs["type"] == "batch") & (logs["batch_id"] == brow["batch_id"])
             ]
             affected_batch_ings = batch_ings[batch_ings["batch_id"] == brow["batch_id"]]
+            dependent_dish_ings = dings[
+                dings["ingredient_batch_id"] == brow["batch_id"]
+            ]
+            dependent_batch_ings = batch_ings[
+                (batch_ings["ingredient_batch_id"] == brow["batch_id"])
+                & (batch_ings["batch_id"] != brow["batch_id"])
+            ]
             st.warning(
                 f"Deleting this batch will remove {len(affected_batch_logs)} batch log entries and {len(affected_batch_ings)} batch ingredient snapshot rows."
             )
+            if not dependent_dish_ings.empty or not dependent_batch_ings.empty:
+                st.error(
+                    f"This batch is still used as an ingredient in {len(dependent_dish_ings)} dish template row(s) "
+                    f"and {len(dependent_batch_ings)} saved batch snapshot row(s). Remove those references first."
+                )
             confirm_batch = st.text_input(
                 "Type the exact batch label to confirm",
                 key="confirm_batch_delete",
             )
             if st.button("Delete batch", key="delete_batch_button"):
-                if confirm_batch.strip() == bdel:
+                if not dependent_dish_ings.empty or not dependent_batch_ings.empty:
+                    st.error("This batch is still referenced by dish or batch ingredients.")
+                elif confirm_batch.strip() == bdel:
                     logs = logs.drop(affected_batch_logs.index)
                     batches = batches[batches["batch_id"] != brow["batch_id"]]
                     batch_ings = batch_ings[batch_ings["batch_id"] != brow["batch_id"]]

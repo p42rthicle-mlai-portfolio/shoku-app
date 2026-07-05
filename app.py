@@ -2704,7 +2704,7 @@ with tabs[3]:
         "Foods are atomic ingredients or packaged items. Food + unit is unique, so Milk [ml] and Milk [cup] are separate entries. Enter nutrition using a base quantity, like 100g or 250ml; Shoku derives per-unit values automatically.",
         level=3,
     )
-    with collapsible_panel("Add food", "add_food", default_open=True) as panel_open:
+    with collapsible_panel("Add food", "add_food") as panel_open:
         if panel_open:
             st.caption(
                 "Create a reusable food definition. Example: Rice, unit g, base quantity 100, calories 130, protein 2.7, fiber 0.4."
@@ -3071,7 +3071,7 @@ with tabs[3]:
         "Dishes are reusable meals or recipes. Use override mode for manually known nutrition per serving. Leave override off for ingredient-based dishes that calculate nutrition from foods.",
         level=3,
     )
-    with collapsible_panel("Add / update dish", "add_update_dish", default_open=True) as panel_open:
+    with collapsible_panel("Add / update dish", "add_update_dish") as panel_open:
         if panel_open:
             st.caption(
             "Use this to create or update a dish shell. Example override: Tea = 70 kcal, 2g protein, and 0g fiber per serving. Example ingredient dish: Dal with final dish quantity 850 and unit g, then add ingredients below."
@@ -3361,7 +3361,7 @@ with tabs[3]:
                     st.success(f"Dish {dsel_edit} updated and logs recalculated.")
                     st.rerun()
 
-    with collapsible_panel("Add ingredient to dish (for computed dishes)", "add_ing_dish", default_open=True) as panel_open:
+    with collapsible_panel("Add ingredient to dish (for computed dishes)", "add_ing_dish") as panel_open:
         if panel_open:
             st.caption(
             "Add foods or saved batches into an ingredient-based dish. Example: 200g raw dal + 20g ghee + 300g of yesterday's cooked rajma batch."
@@ -3658,7 +3658,7 @@ with tabs[3]:
         "Batches are immutable snapshots of one real cook. Create a new batch each time the ingredient quantities, servings, or final weight differ so old logs never change.",
         level=3,
     )
-    with collapsible_panel("Create batch from dish", "create_batch", default_open=True) as panel_open:
+    with collapsible_panel("Create batch from dish", "create_batch") as panel_open:
         if panel_open:
             st.caption(
                 "Use a dish as a template, then change ingredient quantities, servings, and final weight for this one cooked batch. Logging against batches preserves history even if you later change the dish template."
